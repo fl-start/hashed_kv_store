@@ -1,5 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:isolate';
+
+import 'package:crypto/crypto.dart';
+import 'package:path/path.dart' as p;
 
 import 'kv_router_isolate.dart';
 
@@ -19,42 +24,56 @@ class KvNotFoundException implements Exception {
 ///
 /// Behind the scenes:
 /// - Spawns one router isolate.
-/// - Router spawns a pool of worker isolates.
-/// - Writes for the same (key, extension) are serialized:
-///     they are enqueued and processed one after another.
+/// - Router spawns a pool of read worker isolates.
+/// - A single dedicated writer isolate is lazily created on first write.
+/// - All disk writes are globally serialized in strict FIFO order.
 /// - Reads can be handled by any worker (filesystem is shared).
 class MultiIsolateKvStoreClient {
   final SendPort _routerPort;
+  final int _folderHierarchyLevels;
 
-  MultiIsolateKvStoreClient._(this._routerPort);
+  MultiIsolateKvStoreClient._(this._routerPort, this._folderHierarchyLevels);
 
-  /// Spawns the router + worker pool and returns a client
-  /// bound to that router.
+  /// Spawns the router and write worker pool. Returns a client bound to that router.
   ///
   /// [rootDirPath] is the directory where all KV files live.
-  /// [numWorkers] controls how many worker isolates to spawn.
+  /// [numWriteWorkers] controls how many write worker isolates to spawn, sharded by key (default: 2).
+  /// [folderHierarchyLevels] controls the folder nesting depth (0, 1, or 2; default: 1).
+  ///   0: files stored directly in root
+  ///   1: files stored in one folder level (2 chars)
+  ///   2: files stored in two folder levels (2 chars each)
+  /// [writeIdlePurgeDuration] controls when idle write workers may be purged (default: 60 seconds).
   static Future<MultiIsolateKvStoreClient> spawn({
     required String rootDirPath,
-    int numWorkers = 4,
+    int numWriteWorkers = 2,
+    int folderHierarchyLevels = 1,
+    Duration writeIdlePurgeDuration = const Duration(seconds: 60),
   }) async {
     final init = ReceivePort();
     await Isolate.spawn(
       kvRouterIsolateEntry,
-      [rootDirPath, numWorkers, init.sendPort],
+      [
+        rootDirPath,
+        init.sendPort,
+        writeIdlePurgeDuration.inMilliseconds,
+        numWriteWorkers,
+        folderHierarchyLevels,
+      ],
     );
     final routerPort = await init.first as SendPort;
-    return MultiIsolateKvStoreClient._(routerPort);
+    return MultiIsolateKvStoreClient._(routerPort, folderHierarchyLevels);
   }
 
   /// Streaming write into the KV store for [key] with [extension].
   ///
   /// Semantics:
-  /// - Writes for the same (key, extension) are enqueued:
-  ///   only one active write at a time; subsequent writes wait.
+  /// - Writes for the same (key, extension) are serialized within a write worker.
+  /// - Different keys may be written concurrently across different write workers.
+  /// - Folder creation is centralized through a master folder isolate.
   /// - This method:
   ///   1) sends an 'openWrite' request and waits for ACK containing a [writeId].
   ///   2) streams chunks via 'writeChunk' messages.
-  ///   3) finishes with a 'writeEnd' message.
+  ///   3) finishes with a 'writeEnd' message and waits for durability ack.
   ///
   /// [data] is a stream of raw byte chunks.
   /// [extension] should be provided without a leading dot, e.g. 'eml', 'bin'.
@@ -79,8 +98,6 @@ class MultiIsolateKvStoreClient {
     replyPort.close();
 
     final writeId = ack['writeId'] as int;
-    // workerIndex is also returned but not needed on the client side;
-    // router uses it internally for sharding.
 
     // Step 2: send chunks.
     await for (final chunk in data) {
@@ -94,12 +111,16 @@ class MultiIsolateKvStoreClient {
     }
 
     // Step 3: signal end of write.
+    final endReply = ReceivePort();
     _routerPort.send(<String, dynamic>{
       'type': 'writeEnd',
       'key': key,
       'ext': extension,
       'writeId': writeId,
+      'replyPort': endReply.sendPort,
     });
+    await endReply.first;
+    endReply.close();
   }
 
   /// Subscribe to live writes for [key]/[extension].
@@ -134,40 +155,40 @@ class MultiIsolateKvStoreClient {
     return controller.stream;
   }
 
+  /// Get the file path for a key.
+  ///
+  /// This allows any isolate to read the file directly without going through
+  /// the router. The caller is responsible for ensuring the file exists.
+  ///
+  /// [rootDirPath] must be the same directory used when spawning the store.
+  String pathForKey(String rootDirPath, String key, {String extension = 'bin'}) {
+    return _buildPathForKey(rootDirPath, key, extension, _folderHierarchyLevels);
+  }
+
   /// Streaming read for the value stored under [key]/[extension].
   ///
-  /// - Router may route the read to *any* worker, since all
-  ///   see the same filesystem.
-  /// - The returned stream emits file chunks and then completes.
-  /// - If the key does not exist, the stream will emit a [StateError]
-  ///   with message 'not_found' and then close.
+  /// Reads directly from disk without going through worker isolates.
+  /// The returned stream emits file chunks and then completes.
+  /// If the key does not exist, the stream will emit a [StateError]
+  /// with message 'not_found' and then close.
+  ///
+  /// [rootDirPath] must be the same directory used when spawning the store.
   Stream<List<int>> readStream(
+    String rootDirPath,
     String key, {
     String extension = 'bin',
-  }) {
-    final recv = ReceivePort();
-    _routerPort.send(<String, dynamic>{
-      'type': 'readStream',
-      'key': key,
-      'ext': extension,
-      'replyPort': recv.sendPort,
-    });
+  }) async* {
+    final filePath = pathForKey(rootDirPath, key, extension: extension);
+    final file = File(filePath);
 
-    final controller = StreamController<List<int>>();
+    if (!await file.exists()) {
+      throw StateError('not_found');
+    }
 
-    recv.listen((message) {
-      if (message == null) {
-        // End-of-stream sentinel from worker.
-        recv.close();
-        controller.close();
-      } else if (message is Map && message['error'] == 'not_found') {
-        controller.addError(StateError('not_found'));
-      } else {
-        controller.add((message as List).cast<int>());
-      }
-    });
-
-    return controller.stream;
+    final stream = file.openRead();
+    await for (final chunk in stream) {
+      yield chunk;
+    }
   }
 
   /// Delete the value for [key]/[extension] if it exists.
@@ -180,6 +201,59 @@ class MultiIsolateKvStoreClient {
       'key': key,
       'ext': extension,
     });
+  }
+}
+
+/// Compute Crockford Base32 encoding for a key (private helper).
+String _computeBase32ForKey(String key) {
+  const String crockfordBase32Lower = '0123456789abcdefghjkmnpqrstvwxyz';
+  final digestBytes = sha256.convert(utf8.encode(key)).bytes;
+  final out = StringBuffer();
+
+  var bitBuffer = 0;
+  var bitCount = 0;
+  for (final byte in digestBytes) {
+    bitBuffer = (bitBuffer << 8) | byte;
+    bitCount += 8;
+    while (bitCount >= 5) {
+      final index = (bitBuffer >> (bitCount - 5)) & 0x1f;
+      out.write(crockfordBase32Lower[index]);
+      bitCount -= 5;
+    }
+  }
+
+  if (bitCount > 0) {
+    final index = (bitBuffer << (5 - bitCount)) & 0x1f;
+    out.write(crockfordBase32Lower[index]);
+  }
+
+  return out.toString();
+}
+
+/// Build a file path based on hierarchy level.
+/// 
+/// [hierarchyLevels]: 0, 1, or 2
+///   0: <rootDir>/<cccc-cccc-cccc-cccc>.<ext>
+///   1: <rootDir>/<cc>/<cccc-cccc-cccc-cccc>.<ext>
+///   2: <rootDir>/<cc>/<cc>/<cccc-cccc-cccc-cccc>.<ext>
+String _buildPathForKey(String rootDirPath, String key, String extension, int hierarchyLevels) {
+  final digestBase32 = _computeBase32ForKey(key);
+  final stem = digestBase32.substring(4, 20);
+  final fileStem =
+      '${stem.substring(0, 4)}-${stem.substring(4, 8)}-${stem.substring(8, 12)}-${stem.substring(12, 16)}';
+  final fileName =
+      extension.isEmpty ? fileStem : '$fileStem.$extension'.replaceAll('..', '.');
+
+  if (hierarchyLevels == 0) {
+    return p.join(rootDirPath, fileName);
+  } else if (hierarchyLevels == 1) {
+    final level1 = digestBase32.substring(0, 2);
+    return p.join(rootDirPath, level1, fileName);
+  } else {
+    // hierarchyLevels == 2
+    final level1 = digestBase32.substring(0, 2);
+    final level2 = digestBase32.substring(2, 4);
+    return p.join(rootDirPath, level1, level2, fileName);
   }
 }
 

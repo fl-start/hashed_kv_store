@@ -4,12 +4,14 @@ A SHA256-based key/value store with streaming IO and multi-isolate support for D
 
 ## Features
 
-- **SHA256-based storage**: Keys are hashed using SHA256 and stored in a two-level folder structure (`<hh>/<hh>/<digest>.<ext>`)
+- **SHA256-based storage**: Keys are hashed using SHA256 and stored in a two-level folder structure (`<cc>/<cc>/<cccc-cccc-cccc-cccc>.<ext>`)
 - **Streaming interfaces**: Both read and write operations use streams for efficient handling of large files
 - **Multi-isolate architecture**: 
-  - Router isolate manages a pool of worker isolates
-  - Concurrent reads and writes across multiple isolates
-  - Per-key write queuing (writes for the same key are serialized)
+  - Router isolate manages multiple write workers
+  - One master folder isolate handles all directory creation (serialized)
+  - Write workers are sharded by key with per-key write serialization
+  - Different keys can be written concurrently to different write workers
+  - Reads can be performed directly from any isolate (including main UI) without going through the router
 - **Live subscriptions**: Subscribe to writes as they happen (similar to `tail -f`)
 - **No polling**: Push-based notifications to subscribers
 
@@ -149,28 +151,42 @@ await store.writeFromStream(key, response.data!.stream, extension: ext);
 
 ### MultiIsolateKvStoreClient
 
-#### `spawn({required String rootDirPath, int numWorkers = 4})`
+#### `spawn({required String rootDirPath, int numWriteWorkers = 2, int folderHierarchyLevels = 1, Duration writeIdlePurgeDuration = const Duration(seconds: 60)})`
 
-Spawns the router and worker pool. Returns a client bound to that router.
+Spawns the router and write workers. Returns a client bound to that router.
 
 - `rootDirPath`: Directory where all KV files are stored
-- `numWorkers`: Number of worker isolates to spawn (default: 4)
+- `numWriteWorkers`: Number of write worker isolates to spawn, sharded by key (default: 2)
+- `folderHierarchyLevels`: Folder nesting depth - 0 (root only), 1 (one folder level), or 2 (two folder levels) (default: 1)
+- `writeIdlePurgeDuration`: Write worker idle timeout before purge (default: 60 seconds)
 
 #### `writeFromStream(String key, Stream<List<int>> data, {String extension = 'bin', bool truncateExisting = true})`
 
 Streaming write into the KV store.
 
-- Writes for the same (key, extension) are enqueued: only one active write at a time
+- Writes for the same (key, extension) are serialized within a write worker
+- Different keys may be written concurrently across different write workers
+- Folder creation is handled by master folder isolate (centralized)
 - `extension`: File extension without leading dot (e.g., 'eml', 'bin')
 - `truncateExisting`: If true, overwrites existing file; otherwise appends
 
-#### `readStream(String key, {String extension = 'bin'})`
+#### `readStream(String rootDirPath, String key, {String extension = 'bin'})`
 
-Streaming read from the KV store.
+Streaming read for the value stored under [key]/[extension].
 
+- Reads directly from disk without going through isolates
 - Returns a `Stream<List<int>>` that emits file chunks
 - Throws `StateError` with message 'not_found' if key doesn't exist
-- Can be routed to any worker isolate
+- Can be called from any isolate (main UI, compute isolates, etc.)
+- `rootDirPath` must be the same directory used when spawning the store
+
+#### `pathForKey(String rootDirPath, String key, {String extension = 'bin'})`
+
+Get the file path for a key on disk.
+
+- Allows any isolate to read files directly using standard File I/O
+- Returns the full file path as a string
+- Useful for advanced use cases where you need direct file access
 
 #### `subscribeLive(String key, {String extension = 'bin'})`
 
@@ -188,25 +204,45 @@ Delete the value for a key if it exists.
 
 The package uses a multi-isolate architecture:
 
-1. **Router isolate**: Manages worker pool and routes commands
-   - Maintains per-key write queues
-   - Ensures writes for the same key are serialized
-   - Routes reads to any available worker
+1. **Router isolate**: Routes commands to appropriate workers
+  - Routes writes to write workers (sharded by key hash)
+  - Requests folder creation from master folder isolate
 
-2. **Worker isolates**: Handle actual filesystem IO
-   - Each worker owns a `_HashedKvCore` for path mapping
-   - Writes chunks to disk and notifies live subscribers
-   - Handles streaming reads
+2. **Master folder isolate**: Handles all directory creation
+  - Serializes all directory operations
+  - Caches created folders to minimize syscalls
+  - Ensures all folder paths exist before writes
 
-3. **Storage layout**: Files are stored as:
-   ```
-   <rootDir>/<hh>/<hh>/<sha256-digest>.<extension>
-   ```
-   Where `hh` are the first 4 hex characters of the SHA256 digest.
+3. **Write worker isolates**: Handle file I/O with per-key serialization
+  - Sharded by key hash for parallelism across keys
+  - Per-key write queue: writes to same (key, ext) are serialized
+  - Notifies live subscribers as data is written
+  - May self-purge after configured idle timeout
+
+4. **Direct reads**: Reads can be performed from any isolate
+  - Main UI isolate can read directly without blocking
+  - Compute isolates can perform concurrent reads
+  - Use `pathForKey()` to get file paths for custom I/O operations
+  - Use `readStream()` for async streaming reads
+
+5. **Storage layout**: Files are stored based on configured hierarchy level:
+   - **Level 0 (flat)**: `<rootDir>/<cccc-cccc-cccc-cccc>.<extension>`
+   - **Level 1 (default)**: `<rootDir>/<cc>/<cccc-cccc-cccc-cccc>.<extension>`
+   - **Level 2 (nested)**: `<rootDir>/<cc>/<cc>/<cccc-cccc-cccc-cccc>.<extension>`
+  
+  Where each `c` is a lowercase Crockford Base32 character derived from the
+  SHA256 digest. Only the first 20 Crockford Base32 characters are used:
+  - first 2 chars -> optional first folder (levels 1-2)
+  - next 2 chars -> optional second folder (level 2 only)
+  - next 16 chars -> file stem formatted as `xxxx-xxxx-xxxx-xxxx`
+  Remaining digest characters are ignored.
 
 ## Additional information
 
 - All operations are fully streaming - no buffering of entire files in memory
-- Writes for the same key are automatically queued and processed sequentially
-- Reads can be served by any worker isolate for better load distribution
+- Writes for the same (key, extension) are serialized within their write worker
+- Different keys can be written concurrently to different write workers
+- All folder operations are centralized for simplicity and consistency
+- Reads are fully decoupled from the router and can be done from any isolate
+- Direct read access allows zero-copy patterns for compute-intensive workloads
 - Live subscriptions work across isolates without polling

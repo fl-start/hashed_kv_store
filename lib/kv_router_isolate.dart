@@ -1,22 +1,23 @@
 import 'dart:isolate';
+import 'dart:io';
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+import 'package:path/path.dart' as p;
 
 import 'kv_worker_isolate.dart';
 
 typedef _Cmd = Map<String, dynamic>;
 
-class _PendingWrite {
+class _LiveSubscription {
   final String key;
-  final String extension;
-  final bool truncate;
-  final SendPort replyPort;
-  final int workerIndex;
+  final String ext;
+  final SendPort subscriberPort;
 
-  _PendingWrite({
+  _LiveSubscription({
     required this.key,
-    required this.extension,
-    required this.truncate,
-    required this.replyPort,
-    required this.workerIndex,
+    required this.ext,
+    required this.subscriberPort,
   });
 }
 
@@ -24,48 +25,45 @@ class _PendingWrite {
 ///
 /// args:
 /// - args[0]: String rootDirPath
-/// - args[1]: int numWorkers
-/// - args[2]: SendPort initPort (for returning router's SendPort)
+/// - args[1]: SendPort initPort (for returning router's SendPort)
+/// - args[2]: int writeIdlePurgeMs
+/// - args[3]: int numWriteWorkers
+/// - args[4]: int folderHierarchyLevels (default: 1)
 void kvRouterIsolateEntry(List<dynamic> args) async {
   final String rootDirPath = args[0] as String;
-  final int numWorkers = args[1] as int;
-  final SendPort initPort = args[2] as SendPort;
+  final SendPort initPort = args[1] as SendPort;
+  final int writeIdlePurgeMs = (args.length > 2 ? args[2] as int : 60000);
+  final int numWriteWorkers = (args.length > 3 ? args[3] as int : 2);
+  final int folderHierarchyLevels = (args.length > 4 ? args[4] as int : 1);
 
-  // ----------------- Spawn worker isolates -----------------
-  final workers = <SendPort>[];
-  for (var i = 0; i < numWorkers; i++) {
+  // Helper to compute stable worker index from key
+  int workerIndexForKey(String key) {
+    final hash = key.codeUnits.fold<int>(0, (a, b) => a + b);
+    return hash % numWriteWorkers;
+  }
+
+  // ----------------- Spawn multiple write workers with per-key queuing -----------------
+  final writeWorkers = <SendPort>[];
+  for (var i = 0; i < numWriteWorkers; i++) {
     final init = ReceivePort();
     await Isolate.spawn(
-      kvWorkerIsolateEntry,
-      [rootDirPath, init.sendPort],
+      kvWriteWorkerIsolateEntry,
+      [rootDirPath, init.sendPort, writeIdlePurgeMs, folderHierarchyLevels],
     );
     final workerPort = await init.first as SendPort;
-    workers.add(workerPort);
+    writeWorkers.add(workerPort);
   }
 
-  // ----------------- Routing / sharding helpers -----------------
-  int workerIndexForKey(String key) {
-    // Simple stable hash -> worker index. Replace with better hash if needed.
-    final hash = key.codeUnits.fold<int>(0, (a, b) => a + b);
-    return hash % workers.length;
-  }
+  // ----------------- Master folder isolate -----------------
+  final folderInit = ReceivePort();
+  await Isolate.spawn(
+    kvFolderIsolateEntry,
+    [rootDirPath, folderInit.sendPort, folderHierarchyLevels],
+  );
+  final folderPort = await folderInit.first as SendPort;
 
-  String keyId(String key, String ext) => '$key::$ext';
-
-  // ----------------- Per-key write queue state -----------------
-  // keyId -> currently active writeId (or null)
-  final activeWriteIdForKey = <String, int?>{};
-
-  // keyId -> queue of pending writes
-  final pendingWritesForKey = <String, List<_PendingWrite>>{};
-
-  // Router global writeId generator
-  var nextWriteId = 1;
-
-  int allocWriteId() => nextWriteId++;
-
-  // ----------------- Read routing state (round-robin) -----------------
-  var readRR = 0;
+  // Track live subscriptions for replay on write worker restarts
+  final liveSubscriptions = <_LiveSubscription>[];
 
   final routerPort = ReceivePort();
   initPort.send(routerPort.sendPort);
@@ -76,123 +74,47 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
 
     switch (type) {
       // =========================================================
-      //  OPEN WRITE (queue per key)
+      //  OPEN WRITE (ensure folder, then route to write worker)
       // =========================================================
       case 'openWrite':
         {
           final key = cmd['key'] as String;
           final ext = cmd['ext'] as String;
-          final truncate = cmd['truncate'] as bool? ?? true;
-          final replyPort = cmd['replyPort'] as SendPort;
           final workerIdx = workerIndexForKey(key);
-          final k = keyId(key, ext);
-          final active = activeWriteIdForKey[k];
 
-          if (active == null) {
-            // No active write: allocate and start immediately.
-            final writeId = allocWriteId();
-            activeWriteIdForKey[k] = writeId;
+          // Ask folder isolate to ensure directories exist
+          final folderReply = ReceivePort();
+          folderPort.send(<String, dynamic>{
+            'type': 'ensureFolder',
+            'key': key,
+            'replyPort': folderReply.sendPort,
+          });
+          await folderReply.first;
+          folderReply.close();
 
-            workers[workerIdx].send(<String, dynamic>{
-              'type': 'writeStart',
-              'key': key,
-              'ext': ext,
-              'truncate': truncate,
-              'writeId': writeId,
-            });
-
-            // ACK client with writeId (and workerIndex if needed).
-            replyPort.send(<String, dynamic>{
-              'writeId': writeId,
-              'workerIndex': workerIdx,
-            });
-          } else {
-            // There is an active write: enqueue this one.
-            final queue =
-                pendingWritesForKey.putIfAbsent(k, () => <_PendingWrite>[]);
-            queue.add(_PendingWrite(
-              key: key,
-              extension: ext,
-              truncate: truncate,
-              replyPort: replyPort,
-              workerIndex: workerIdx,
-            ));
-          }
+          // Route to appropriate write worker
+          writeWorkers[workerIdx].send(cmd);
         }
         break;
 
-      // =========================================================
-      //  WRITE CHUNK / END (only active write per key)
-      // =========================================================
       case 'writeChunk':
         {
           final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
-          final writeId = cmd['writeId'] as int;
-          final chunk = cmd['chunk'] as List;
-          final k = keyId(key, ext);
-          final active = activeWriteIdForKey[k];
-
-          // Ignore non-active writes for this key.
-          if (active != writeId) break;
-
           final workerIdx = workerIndexForKey(key);
-          workers[workerIdx].send(<String, dynamic>{
-            'type': 'writeChunk',
-            'writeId': writeId,
-            'chunk': chunk,
-          });
+          writeWorkers[workerIdx].send(cmd);
         }
         break;
 
       case 'writeEnd':
         {
           final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
-          final writeId = cmd['writeId'] as int;
-          final k = keyId(key, ext);
-          final active = activeWriteIdForKey[k];
-
-          if (active != writeId) break;
-
           final workerIdx = workerIndexForKey(key);
-          workers[workerIdx].send(<String, dynamic>{
-            'type': 'writeEnd',
-            'writeId': writeId,
-          });
-
-          // Free this key, then start next queued write if any.
-          activeWriteIdForKey[k] = null;
-
-          final queue = pendingWritesForKey[k];
-          if (queue != null && queue.isNotEmpty) {
-            final next = queue.removeAt(0);
-            final newWriteId = allocWriteId();
-            activeWriteIdForKey[k] = newWriteId;
-
-            workers[next.workerIndex].send(<String, dynamic>{
-              'type': 'writeStart',
-              'key': next.key,
-              'ext': next.extension,
-              'truncate': next.truncate,
-              'writeId': newWriteId,
-            });
-
-            // ACK next writer so it can now send chunks.
-            next.replyPort.send(<String, dynamic>{
-              'writeId': newWriteId,
-              'workerIndex': next.workerIndex,
-            });
-
-            if (queue.isEmpty) {
-              pendingWritesForKey.remove(k);
-            }
-          }
+          writeWorkers[workerIdx].send(cmd);
         }
         break;
 
       // =========================================================
-      //  LIVE SUBSCRIBE (sharded by key)
+      //  LIVE SUBSCRIBE (route to appropriate write worker)
       // =========================================================
       case 'subscribeLive':
         {
@@ -201,57 +123,107 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
           final subscriberPort = cmd['subscriberPort'] as SendPort;
           final workerIdx = workerIndexForKey(key);
 
-          workers[workerIdx].send(<String, dynamic>{
-            'type': 'subscribeLive',
-            'key': key,
-            'ext': ext,
-            'subscriberPort': subscriberPort,
-          });
+          liveSubscriptions.add(
+            _LiveSubscription(
+              key: key,
+              ext: ext,
+              subscriberPort: subscriberPort,
+            ),
+          );
+
+          writeWorkers[workerIdx].send(cmd);
         }
         break;
 
       // =========================================================
-      //  READ STREAM (can go to any worker)
-      // =========================================================
-      case 'readStream':
-        {
-          final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
-          final replyPort = cmd['replyPort'] as SendPort;
-
-          // Choose worker round-robin.
-          final idx = readRR % workers.length;
-          readRR = (readRR + 1);
-
-          workers[idx].send(<String, dynamic>{
-            'type': 'readStream',
-            'key': key,
-            'ext': ext,
-            'replyPort': replyPort,
-          });
-        }
-        break;
-
-      // =========================================================
-      //  DELETE (sharded by key, no queueing)
+      //  DELETE (route to appropriate write worker)
       // =========================================================
       case 'delete':
         {
           final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
           final workerIdx = workerIndexForKey(key);
-
-          workers[workerIdx].send(<String, dynamic>{
-            'type': 'delete',
-            'key': key,
-            'ext': ext,
-          });
+          writeWorkers[workerIdx].send(cmd);
         }
         break;
 
       default:
-        // Unknown command; ignore or log.
         break;
     }
   }
+}
+
+/// Master folder isolate: handles all directory creation operations.
+///
+/// args:
+/// - args[0]: String rootDirPath
+/// - args[1]: SendPort initPort
+/// - args[2]: int folderHierarchyLevels (default: 1)
+void kvFolderIsolateEntry(List<dynamic> args) async {
+  final String rootDirPath = args[0] as String;
+  final SendPort initPort = args[1] as SendPort;
+  final int folderHierarchyLevels = (args.length > 2 ? args[2] as int : 1);
+  final rootDir = Directory(rootDirPath);
+  final createdFolders = <String>{};
+
+  final cmdPort = ReceivePort();
+  initPort.send(cmdPort.sendPort);
+
+  await for (final raw in cmdPort) {
+    final cmd = raw as _Cmd;
+    final type = cmd['type'] as String;
+
+    if (type == 'ensureFolder') {
+      final key = cmd['key'] as String;
+      final replyPort = cmd['replyPort'] as SendPort;
+
+      // Compute folder path from key
+      final digestBase32 = _computeBase32ForKey(key);
+      String folderPath;
+
+      if (folderHierarchyLevels == 0) {
+        folderPath = rootDir.path;
+      } else if (folderHierarchyLevels == 1) {
+        final level1 = digestBase32.substring(0, 2);
+        folderPath = p.join(rootDir.path, level1);
+      } else {
+        // folderHierarchyLevels == 2
+        final level1 = digestBase32.substring(0, 2);
+        final level2 = digestBase32.substring(2, 4);
+        folderPath = p.join(rootDir.path, level1, level2);
+      }
+
+      // Only create if not already created in this isolate session
+      if (!createdFolders.contains(folderPath)) {
+        await Directory(folderPath).create(recursive: true);
+        createdFolders.add(folderPath);
+      }
+
+      replyPort.send({'ok': true});
+    }
+  }
+}
+
+String _computeBase32ForKey(String key) {
+  const String crockfordBase32Lower = '0123456789abcdefghjkmnpqrstvwxyz';
+  final digestBytes = sha256.convert(utf8.encode(key)).bytes;
+  final out = StringBuffer();
+
+  var bitBuffer = 0;
+  var bitCount = 0;
+  for (final byte in digestBytes) {
+    bitBuffer = (bitBuffer << 8) | byte;
+    bitCount += 8;
+    while (bitCount >= 5) {
+      final index = (bitBuffer >> (bitCount - 5)) & 0x1f;
+      out.write(crockfordBase32Lower[index]);
+      bitCount -= 5;
+    }
+  }
+
+  if (bitCount > 0) {
+    final index = (bitBuffer << (5 - bitCount)) & 0x1f;
+    out.write(crockfordBase32Lower[index]);
+  }
+
+  return out.toString();
 }
