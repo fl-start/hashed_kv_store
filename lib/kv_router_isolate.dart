@@ -7,14 +7,11 @@ import 'kv_worker_isolate.dart';
 
 typedef _Cmd = Map<String, dynamic>;
 
+void _sendError(SendPort? port, Object error) {
+  port?.send(<String, dynamic>{'error': error.toString()});
+}
+
 /// Router isolate entry.
-///
-/// args:
-/// - args[0]: String rootDirPath
-/// - args[1]: SendPort initPort (for returning router's SendPort)
-/// - args[2]: int writeIdlePurgeMs
-/// - args[3]: int numWriteWorkers
-/// - args[4]: int folderHierarchyLevels (default: 1)
 void kvRouterIsolateEntry(List<dynamic> args) async {
   final String rootDirPath = args[0] as String;
   final SendPort initPort = args[1] as SendPort;
@@ -22,25 +19,47 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
   final int numWriteWorkers = (args.length > 3 ? args[3] as int : 2);
   final int folderHierarchyLevels = (args.length > 4 ? args[4] as int : 1);
 
-  // Helper to compute stable worker index from key
   int workerIndexForKey(String key) {
-    final hash = key.codeUnits.fold<int>(0, (a, b) => a + b);
+    final digest = HashedKvPath.crockfordBase32ForKey(key);
+    var hash = 0;
+    for (var i = 0; i < digest.length && i < 4; i++) {
+      hash = (hash * 31 + digest.codeUnitAt(i)) & 0x7fffffff;
+    }
     return hash % numWriteWorkers;
   }
 
-  // ----------------- Spawn multiple write workers with per-key queuing -----------------
-  final writeWorkers = <SendPort>[];
-  for (var i = 0; i < numWriteWorkers; i++) {
+  final writeWorkers = List<SendPort?>.filled(numWriteWorkers, null);
+
+  Future<void> spawnWorker(int index) async {
     final init = ReceivePort();
+    final workerControlPort = ReceivePort();
     await Isolate.spawn(
       kvWriteWorkerIsolateEntry,
-      [rootDirPath, init.sendPort, writeIdlePurgeMs, folderHierarchyLevels],
+      [
+        rootDirPath,
+        init.sendPort,
+        writeIdlePurgeMs,
+        folderHierarchyLevels,
+        index,
+        workerControlPort.sendPort,
+      ],
     );
-    final workerPort = await init.first as SendPort;
-    writeWorkers.add(workerPort);
+    writeWorkers[index] = await init.first as SendPort;
+
+    workerControlPort.listen((raw) async {
+      if (raw is! _Cmd) return;
+      if (raw['type'] == 'workerExiting' && raw['index'] == index) {
+        writeWorkers[index] = null;
+        workerControlPort.close();
+        await spawnWorker(index);
+      }
+    });
   }
 
-  // ----------------- Master folder isolate -----------------
+  for (var i = 0; i < numWriteWorkers; i++) {
+    await spawnWorker(i);
+  }
+
   final folderInit = ReceivePort();
   await Isolate.spawn(
     kvFolderIsolateEntry,
@@ -56,64 +75,48 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
     final type = cmd['type'] as String;
 
     switch (type) {
-      // =========================================================
-      //  OPEN WRITE (ensure folder, then route to write worker)
-      // =========================================================
       case 'openWrite':
         {
           final key = cmd['key'] as String;
+          final replyPort = cmd['replyPort'] as SendPort;
           final workerIdx = workerIndexForKey(key);
+          final workerPort = writeWorkers[workerIdx];
+          if (workerPort == null) {
+            _sendError(replyPort, StateError('write worker unavailable'));
+            break;
+          }
 
-          // Ask folder isolate to ensure directories exist
           final folderReply = ReceivePort();
           folderPort.send(<String, dynamic>{
             'type': 'ensureFolder',
             'key': key,
             'replyPort': folderReply.sendPort,
           });
-          await folderReply.first;
+          final folderResult = await folderReply.first as Map;
           folderReply.close();
 
-          // Route to appropriate write worker
-          writeWorkers[workerIdx].send(cmd);
+          if (folderResult.containsKey('error')) {
+            _sendError(replyPort, folderResult['error'] as Object);
+            break;
+          }
+
+          workerPort.send(cmd);
         }
         break;
 
-      case 'writeChunk':
-        {
-          final key = cmd['key'] as String;
-          final workerIdx = workerIndexForKey(key);
-          writeWorkers[workerIdx].send(cmd);
-        }
-        break;
-
-      case 'writeEnd':
-        {
-          final key = cmd['key'] as String;
-          final workerIdx = workerIndexForKey(key);
-          writeWorkers[workerIdx].send(cmd);
-        }
-        break;
-
-      // =========================================================
-      //  LIVE SUBSCRIBE (route to appropriate write worker)
-      // =========================================================
       case 'subscribeLive':
         {
           final key = cmd['key'] as String;
           final workerIdx = workerIndexForKey(key);
-          writeWorkers[workerIdx].send(cmd);
+          writeWorkers[workerIdx]?.send(cmd);
         }
         break;
 
-      // =========================================================
-      //  DELETE (route to appropriate write worker)
-      // =========================================================
       case 'delete':
         {
           final key = cmd['key'] as String;
           final workerIdx = workerIndexForKey(key);
-          writeWorkers[workerIdx].send(cmd);
+          writeWorkers[workerIdx]?.send(cmd);
         }
         break;
 
@@ -124,11 +127,6 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
 }
 
 /// Master folder isolate: handles all directory creation operations.
-///
-/// args:
-/// - args[0]: String rootDirPath
-/// - args[1]: SendPort initPort
-/// - args[2]: int folderHierarchyLevels (default: 1)
 void kvFolderIsolateEntry(List<dynamic> args) async {
   final String rootDirPath = args[0] as String;
   final SendPort initPort = args[1] as SendPort;
@@ -140,25 +138,26 @@ void kvFolderIsolateEntry(List<dynamic> args) async {
 
   await for (final raw in cmdPort) {
     final cmd = raw as _Cmd;
-    final type = cmd['type'] as String;
+    if (cmd['type'] != 'ensureFolder') continue;
 
-    if (type == 'ensureFolder') {
-      final key = cmd['key'] as String;
-      final replyPort = cmd['replyPort'] as SendPort;
+    final key = cmd['key'] as String;
+    final replyPort = cmd['replyPort'] as SendPort;
 
+    try {
       final folderPath = HashedKvPath.folderPathForKey(
         rootDirPath,
         key,
         folderHierarchyLevels,
       );
 
-      // Only create if not already created in this isolate session
       if (!createdFolders.contains(folderPath)) {
         await Directory(folderPath).create(recursive: true);
         createdFolders.add(folderPath);
       }
 
-      replyPort.send({'ok': true});
+      replyPort.send(<String, dynamic>{'ok': true});
+    } catch (e) {
+      replyPort.send(<String, dynamic>{'error': e.toString()});
     }
   }
 }

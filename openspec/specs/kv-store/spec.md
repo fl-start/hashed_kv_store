@@ -42,6 +42,29 @@ The system SHALL accept writes as a `Stream<List<int>>` without buffering the en
 - **WHEN** a caller streams chunks for a key
 - **THEN** the stored file contains the concatenation of all chunks in order
 
+### Requirement: Atomic Truncate Writes
+
+The system SHALL publish truncate writes atomically by writing to a temp file and renaming over the final path on completion.
+
+#### Scenario: Old content visible during truncate write
+
+- **WHEN** a truncate write is in progress for an existing key
+- **THEN** readers observe the previous file content until the write completes
+
+#### Scenario: New content visible after truncate write
+
+- **WHEN** a truncate write completes successfully
+- **THEN** readers observe only the newly written content
+
+### Requirement: Write Error Propagation
+
+The system SHALL propagate folder, worker, and input-stream failures to the `writeFromStream` caller as [KvWriteException].
+
+#### Scenario: Write failure surfaces to caller
+
+- **WHEN** a write cannot be completed due to an I/O or protocol error
+- **THEN** the caller's `writeFromStream` future completes with an error
+
 ### Requirement: Per-Key Write Serialization
 
 The system SHALL serialize writes for the same `(key, extension)` pair within a write worker.
@@ -94,12 +117,17 @@ The system SHALL provide push-based live subscriptions that emit write chunks as
 
 ### Requirement: Delete With Acknowledgement
 
-The system SHALL delete a key's file if present and complete the caller's `delete` future after the write worker processes the command.
+The system SHALL delete a key's file if present and complete the caller's `delete` future after the write worker processes the command. Deletes for a key SHALL be queued behind any active or pending writes for that key.
 
 #### Scenario: Delete existing key
 
 - **WHEN** a caller deletes an existing key
 - **THEN** subsequent reads throw `KvNotFoundException`
+
+#### Scenario: Delete during active write
+
+- **WHEN** a delete is requested while a write is active for the same key
+- **THEN** the delete runs after the active write completes
 
 ### Requirement: Multi-Isolate Write Architecture
 

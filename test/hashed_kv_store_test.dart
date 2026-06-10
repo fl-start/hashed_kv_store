@@ -262,6 +262,98 @@ void main() {
     expect(relative, isNot(matches(RegExp(r'[ilo]'))));
   });
 
+  test('truncate write keeps old content visible until complete', () async {
+    const key = 'atomic:replace';
+    const ext = 'txt';
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('version1')),
+      extension: ext,
+    );
+
+    final controller = StreamController<List<int>>();
+    final writeFuture = store.writeFromStream(
+      key,
+      controller.stream,
+      extension: ext,
+    );
+
+    await Future.delayed(const Duration(milliseconds: 80));
+
+    final midBytes = <int>[];
+    await for (final chunk in store.readStream(tempDir.path, key, extension: ext)) {
+      midBytes.addAll(chunk);
+    }
+    expect(utf8.decode(midBytes), equals('version1'));
+
+    controller.add(utf8.encode('version2'));
+    await controller.close();
+    await writeFuture;
+
+    final finalBytes = <int>[];
+    await for (final chunk in store.readStream(tempDir.path, key, extension: ext)) {
+      finalBytes.addAll(chunk);
+    }
+    expect(utf8.decode(finalBytes), equals('version2'));
+  });
+
+  test('append mode preserves existing content', () async {
+    const key = 'append:test';
+    const ext = 'txt';
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('part1')),
+      extension: ext,
+    );
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('part2')),
+      extension: ext,
+      truncateExisting: false,
+    );
+
+    final bytes = <int>[];
+    await for (final chunk in store.readStream(tempDir.path, key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals('part1part2'));
+  });
+
+  test('delete waits for active write to finish', () async {
+    const key = 'delete:during:write';
+    const ext = 'txt';
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('keep-until-delete')),
+      extension: ext,
+    );
+
+    final controller = StreamController<List<int>>();
+    final writeFuture = store.writeFromStream(
+      key,
+      controller.stream,
+      extension: ext,
+    );
+
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    final deleteFuture = store.delete(key, extension: ext);
+    controller.add(utf8.encode('should-not-appear'));
+    await controller.close();
+    await writeFuture;
+    await deleteFuture;
+
+    final readStream = store.readStream(tempDir.path, key, extension: ext);
+    expect(
+      () async => await readStream.forEach((_) {}),
+      throwsA(isA<KvNotFoundException>()),
+    );
+  });
+
   test('different keys can be written concurrently across workers', () async {
     const key1 = 'concurrent:key:alpha';
     const key2 = 'concurrent:key:beta';
