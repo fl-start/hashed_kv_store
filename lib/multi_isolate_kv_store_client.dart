@@ -36,20 +36,21 @@ void _throwIfError(Map<dynamic, dynamic> response) {
 }
 
 /// Public client API for the multi-isolate KV store.
-///
-/// Behind the scenes:
-/// - Spawns one router isolate.
-/// - Router spawns a pool of write worker isolates, sharded by key.
-/// - A master folder isolate serializes all directory creation.
-/// - Writes for the same (key, extension) are serialized within a write worker.
-/// - Truncate writes use a temp file and atomic rename on completion.
-/// - Write chunks are sent directly to the responsible worker isolate.
-/// - Reads bypass isolates and read directly from the shared filesystem.
 class MultiIsolateKvStoreClient {
   final SendPort _routerPort;
+  final String _rootDirPath;
   final int _folderHierarchyLevels;
+  final int _writeMaxInFlightChunks;
 
-  MultiIsolateKvStoreClient._(this._routerPort, this._folderHierarchyLevels);
+  MultiIsolateKvStoreClient._(
+    this._routerPort,
+    this._rootDirPath,
+    this._folderHierarchyLevels,
+    this._writeMaxInFlightChunks,
+  );
+
+  /// Root directory where KV files are stored (from [spawn]).
+  String get rootDirPath => _rootDirPath;
 
   /// Spawns the router and write worker pool. Returns a client bound to that router.
   static Future<MultiIsolateKvStoreClient> spawn({
@@ -57,6 +58,10 @@ class MultiIsolateKvStoreClient {
     int numWriteWorkers = 2,
     int folderHierarchyLevels = 1,
     Duration writeIdlePurgeDuration = const Duration(seconds: 60),
+    bool fsyncOnClose = false,
+    int flushThresholdBytes = 64 * 1024,
+    Duration flushInterval = const Duration(milliseconds: 100),
+    int writeMaxInFlightChunks = 8,
   }) async {
     final init = ReceivePort();
     await Isolate.spawn(
@@ -67,16 +72,21 @@ class MultiIsolateKvStoreClient {
         writeIdlePurgeDuration.inMilliseconds,
         numWriteWorkers,
         folderHierarchyLevels,
+        fsyncOnClose,
+        flushThresholdBytes,
+        flushInterval.inMilliseconds,
       ],
     );
     final routerPort = await init.first as SendPort;
-    return MultiIsolateKvStoreClient._(routerPort, folderHierarchyLevels);
+    return MultiIsolateKvStoreClient._(
+      routerPort,
+      rootDirPath,
+      folderHierarchyLevels,
+      writeMaxInFlightChunks,
+    );
   }
 
   /// Streaming write into the KV store for [key] with [extension].
-  ///
-  /// Truncate writes are atomically published via temp file + rename.
-  /// Chunk data is transferred with [TransferableTypedData] to reduce copies.
   Future<void> writeFromStream(
     String key,
     Stream<List<int>> data, {
@@ -99,8 +109,27 @@ class MultiIsolateKvStoreClient {
     final writeId = ack['writeId'] as int;
     final workerPort = ack['workerPort'] as SendPort;
 
+    ReceivePort? creditPort;
+    var credits = _writeMaxInFlightChunks;
+    if (_writeMaxInFlightChunks > 0) {
+      creditPort = ReceivePort();
+      workerPort.send(<String, dynamic>{
+        'type': 'registerCredits',
+        'writeId': writeId,
+        'creditPort': creditPort.sendPort,
+      });
+    }
+
     try {
       await for (final chunk in data) {
+        if (creditPort != null) {
+          while (credits <= 0) {
+            await creditPort.first;
+            credits++;
+          }
+          credits--;
+        }
+
         final transferable = TransferableTypedData.fromList([
           Uint8List.fromList(chunk),
         ]);
@@ -115,8 +144,11 @@ class MultiIsolateKvStoreClient {
         'type': 'writeAbort',
         'writeId': writeId,
       });
+      creditPort?.close();
       rethrow;
     }
+
+    creditPort?.close();
 
     final endReply = ReceivePort();
     workerPort.send(<String, dynamic>{
@@ -129,7 +161,6 @@ class MultiIsolateKvStoreClient {
     _throwIfError(endAck);
   }
 
-  /// Subscribe to live writes for [key]/[extension].
   Stream<List<int>> subscribeLive(
     String key, {
     String extension = 'bin',
@@ -156,21 +187,44 @@ class MultiIsolateKvStoreClient {
     return controller.stream;
   }
 
-  String pathForKey(String rootDirPath, String key, {String extension = 'bin'}) {
+  /// File path for [key], using this client's [rootDirPath].
+  String pathForKey(String key, {String extension = 'bin'}) {
     return HashedKvPath.pathForKey(
-      rootDirPath,
+      _rootDirPath,
       key,
       extension,
       _folderHierarchyLevels,
     );
   }
 
+  /// Read using this client's [rootDirPath].
   Stream<List<int>> readStream(
+    String key, {
+    String extension = 'bin',
+  }) {
+    return _readStreamAt(_rootDirPath, key, extension: extension);
+  }
+
+  /// Read using an explicit [rootDirPath] (e.g. when sharing path logic across clients).
+  Stream<List<int>> readStreamAt(
     String rootDirPath,
     String key, {
     String extension = 'bin',
+  }) {
+    return _readStreamAt(rootDirPath, key, extension: extension);
+  }
+
+  Stream<List<int>> _readStreamAt(
+    String rootDirPath,
+    String key, {
+    required String extension,
   }) async* {
-    final filePath = pathForKey(rootDirPath, key, extension: extension);
+    final filePath = HashedKvPath.pathForKey(
+      rootDirPath,
+      key,
+      extension,
+      _folderHierarchyLevels,
+    );
     final file = File(filePath);
 
     if (!await file.exists()) {
@@ -183,9 +237,6 @@ class MultiIsolateKvStoreClient {
     }
   }
 
-  /// Waits until the write worker has processed the delete command.
-  ///
-  /// Deletes are queued behind any active or pending writes for the same key.
   Future<void> delete(String key, {String extension = 'bin'}) async {
     final replyPort = ReceivePort();
     _routerPort.send(<String, dynamic>{

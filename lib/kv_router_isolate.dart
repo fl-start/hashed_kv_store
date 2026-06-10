@@ -18,6 +18,9 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
   final int writeIdlePurgeMs = (args.length > 2 ? args[2] as int : 60000);
   final int numWriteWorkers = (args.length > 3 ? args[3] as int : 2);
   final int folderHierarchyLevels = (args.length > 4 ? args[4] as int : 1);
+  final bool fsyncOnClose = (args.length > 5 ? args[5] as bool : false);
+  final int flushThresholdBytes = (args.length > 6 ? args[6] as int : 65536);
+  final int flushIntervalMs = (args.length > 7 ? args[7] as int : 100);
 
   int workerIndexForKey(String key) {
     final digest = HashedKvPath.crockfordBase32ForKey(key);
@@ -42,6 +45,9 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
         folderHierarchyLevels,
         index,
         workerControlPort.sendPort,
+        fsyncOnClose,
+        flushThresholdBytes,
+        flushIntervalMs,
       ],
     );
     writeWorkers[index] = await init.first as SendPort;
@@ -78,6 +84,7 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
       case 'openWrite':
         {
           final key = cmd['key'] as String;
+          final ext = cmd['ext'] as String;
           final replyPort = cmd['replyPort'] as SendPort;
           final workerIdx = workerIndexForKey(key);
           final workerPort = writeWorkers[workerIdx];
@@ -86,10 +93,22 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
             break;
           }
 
+          final folderPath = HashedKvPath.folderPathForKey(
+            rootDirPath,
+            key,
+            folderHierarchyLevels,
+          );
+          final filePath = HashedKvPath.pathForKey(
+            rootDirPath,
+            key,
+            ext,
+            folderHierarchyLevels,
+          );
+
           final folderReply = ReceivePort();
           folderPort.send(<String, dynamic>{
             'type': 'ensureFolder',
-            'key': key,
+            'folderPath': folderPath,
             'replyPort': folderReply.sendPort,
           });
           final folderResult = await folderReply.first as Map;
@@ -100,6 +119,7 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
             break;
           }
 
+          cmd['filePath'] = filePath;
           workerPort.send(cmd);
         }
         break;
@@ -115,7 +135,14 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
       case 'delete':
         {
           final key = cmd['key'] as String;
+          final ext = cmd['ext'] as String;
           final workerIdx = workerIndexForKey(key);
+          cmd['filePath'] = HashedKvPath.pathForKey(
+            rootDirPath,
+            key,
+            ext,
+            folderHierarchyLevels,
+          );
           writeWorkers[workerIdx]?.send(cmd);
         }
         break;
@@ -140,15 +167,16 @@ void kvFolderIsolateEntry(List<dynamic> args) async {
     final cmd = raw as _Cmd;
     if (cmd['type'] != 'ensureFolder') continue;
 
-    final key = cmd['key'] as String;
     final replyPort = cmd['replyPort'] as SendPort;
 
     try {
-      final folderPath = HashedKvPath.folderPathForKey(
-        rootDirPath,
-        key,
-        folderHierarchyLevels,
-      );
+      final folderPath = cmd.containsKey('folderPath')
+          ? cmd['folderPath'] as String
+          : HashedKvPath.folderPathForKey(
+              rootDirPath,
+              cmd['key'] as String,
+              folderHierarchyLevels,
+            );
 
       if (!createdFolders.contains(folderPath)) {
         await Directory(folderPath).create(recursive: true);

@@ -33,9 +33,8 @@ import 'dart:convert';
 import 'package:hashed_kv_store/hashed_kv_store.dart';
 
 void main() async {
-  const rootDirPath = './kv_root';
   final store = await MultiIsolateKvStoreClient.spawn(
-    rootDirPath: rootDirPath,
+    rootDirPath: './kv_root',
     numWriteWorkers: 4,
   );
 
@@ -50,7 +49,7 @@ void main() async {
   await store.writeFromStream(key, writeStream, extension: ext);
 
   // Read
-  final readStream = store.readStream(rootDirPath, key, extension: ext);
+  final readStream = store.readStream(key, extension: ext);
   final bytes = <int>[];
   await for (final chunk in readStream) {
     bytes.addAll(chunk);
@@ -165,14 +164,18 @@ await store.writeFromStream(key, response.data!.stream, extension: ext);
 
 ### MultiIsolateKvStoreClient
 
-#### `spawn({required String rootDirPath, int numWriteWorkers = 2, int folderHierarchyLevels = 1, Duration writeIdlePurgeDuration = const Duration(seconds: 60)})`
+#### `spawn({required String rootDirPath, int numWriteWorkers = 2, int folderHierarchyLevels = 1, Duration writeIdlePurgeDuration = const Duration(seconds: 60), bool fsyncOnClose = false, int flushThresholdBytes = 65536, Duration flushInterval = const Duration(milliseconds: 100), int writeMaxInFlightChunks = 8})`
 
 Spawns the router and write workers. Returns a client bound to that router.
 
-- `rootDirPath`: Directory where all KV files are stored
+- `rootDirPath`: Directory where all KV files are stored (also available as `store.rootDirPath`)
 - `numWriteWorkers`: Number of write worker isolates to spawn, sharded by key (default: 2)
 - `folderHierarchyLevels`: Folder nesting depth - 0 (root only), 1 (one folder level), or 2 (two folder levels) (default: 1)
 - `writeIdlePurgeDuration`: Write worker idle timeout before purge (default: 60 seconds)
+- `fsyncOnClose`: When true, fsync file data before acknowledging writes (default: false)
+- `flushThresholdBytes`: Flush sink after chunks of this size (default: 65536)
+- `flushInterval`: Time-based flush interval for live subscribers (default: 100ms)
+- `writeMaxInFlightChunks`: Backpressure window for in-flight chunks; 0 disables (default: 8)
 
 #### `writeFromStream(String key, Stream<List<int>> data, {String extension = 'bin', bool truncateExisting = true})`
 
@@ -184,23 +187,18 @@ Streaming write into the KV store.
 - `extension`: File extension without leading dot (e.g., 'eml', 'bin')
 - `truncateExisting`: If true, overwrites existing file; otherwise appends
 
-#### `readStream(String rootDirPath, String key, {String extension = 'bin'})`
+#### `readStream(String key, {String extension = 'bin'})`
 
-Streaming read for the value stored under [key]/[extension].
+Streaming read for the value stored under [key]/[extension], using the client's `rootDirPath`.
 
 - Reads directly from disk without going through isolates
 - Returns a `Stream<List<int>>` that emits file chunks
 - Throws [KvNotFoundException] if key doesn't exist
-- Can be called from any isolate (main UI, compute isolates, etc.)
-- `rootDirPath` must be the same directory used when spawning the store
+- Use `readStreamAt(rootDirPath, key)` when reading from a different root
 
-#### `pathForKey(String rootDirPath, String key, {String extension = 'bin'})`
+#### `pathForKey(String key, {String extension = 'bin'})`
 
-Get the file path for a key on disk.
-
-- Allows any isolate to read files directly using standard File I/O
-- Returns the full file path as a string
-- Useful for advanced use cases where you need direct file access
+Get the file path for a key on disk under the client's `rootDirPath`.
 
 #### `subscribeLive(String key, {String extension = 'bin'})`
 

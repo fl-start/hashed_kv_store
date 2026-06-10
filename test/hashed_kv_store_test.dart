@@ -46,7 +46,7 @@ void main() {
     await store.writeFromStream(key, writeStream, extension: ext);
 
     // Read
-    final readStream = store.readStream(tempDir.path, key, extension: ext);
+    final readStream = store.readStream(key, extension: ext);
     final bytes = <int>[];
     await for (final chunk in readStream) {
       bytes.addAll(chunk);
@@ -59,7 +59,7 @@ void main() {
     const key = 'non:existent';
     const ext = 'bin';
 
-    final readStream = store.readStream(tempDir.path, key, extension: ext);
+    final readStream = store.readStream(key, extension: ext);
     expect(
       () async => await readStream.forEach((_) {}),
       throwsA(isA<KvNotFoundException>()),
@@ -156,7 +156,7 @@ void main() {
     await Future.delayed(const Duration(milliseconds: 100));
 
     // Read back - second write should have overwritten first (truncateExisting=true by default)
-    final readStream = store.readStream(tempDir.path, key, extension: ext);
+    final readStream = store.readStream(key, extension: ext);
     final bytes = <int>[];
     await for (final chunk in readStream) {
       bytes.addAll(chunk);
@@ -186,7 +186,7 @@ void main() {
     await store.delete(key, extension: ext);
 
     // Read should fail
-    final readStream = store.readStream(tempDir.path, key, extension: ext);
+    final readStream = store.readStream(key, extension: ext);
     expect(
       () async => await readStream.forEach((_) {}),
       throwsA(isA<KvNotFoundException>()),
@@ -214,14 +214,14 @@ void main() {
 
     await Future.delayed(const Duration(milliseconds: 100));
 
-    final read1 = store.readStream(tempDir.path, key, extension: 'ext1');
+    final read1 = store.readStream(key, extension: 'ext1');
     final bytes1 = <int>[];
     await for (final chunk in read1) {
       bytes1.addAll(chunk);
     }
     expect(utf8.decode(bytes1), equals(content1));
 
-    final read2 = store.readStream(tempDir.path, key, extension: 'ext2');
+    final read2 = store.readStream(key, extension: 'ext2');
     final bytes2 = <int>[];
     await for (final chunk in read2) {
       bytes2.addAll(chunk);
@@ -282,7 +282,7 @@ void main() {
     await Future.delayed(const Duration(milliseconds: 80));
 
     final midBytes = <int>[];
-    await for (final chunk in store.readStream(tempDir.path, key, extension: ext)) {
+    await for (final chunk in store.readStream(key, extension: ext)) {
       midBytes.addAll(chunk);
     }
     expect(utf8.decode(midBytes), equals('version1'));
@@ -292,7 +292,7 @@ void main() {
     await writeFuture;
 
     final finalBytes = <int>[];
-    await for (final chunk in store.readStream(tempDir.path, key, extension: ext)) {
+    await for (final chunk in store.readStream(key, extension: ext)) {
       finalBytes.addAll(chunk);
     }
     expect(utf8.decode(finalBytes), equals('version2'));
@@ -316,7 +316,7 @@ void main() {
     );
 
     final bytes = <int>[];
-    await for (final chunk in store.readStream(tempDir.path, key, extension: ext)) {
+    await for (final chunk in store.readStream(key, extension: ext)) {
       bytes.addAll(chunk);
     }
     expect(utf8.decode(bytes), equals('part1part2'));
@@ -347,7 +347,7 @@ void main() {
     await writeFuture;
     await deleteFuture;
 
-    final readStream = store.readStream(tempDir.path, key, extension: ext);
+    final readStream = store.readStream(key, extension: ext);
     expect(
       () async => await readStream.forEach((_) {}),
       throwsA(isA<KvNotFoundException>()),
@@ -387,13 +387,13 @@ void main() {
     await firstWrite;
 
     final key1Bytes = <int>[];
-    await for (final chunk in store.readStream(tempDir.path, key1, extension: ext)) {
+    await for (final chunk in store.readStream(key1, extension: ext)) {
       key1Bytes.addAll(chunk);
     }
     expect(utf8.decode(key1Bytes), contains('first'));
 
     final key2Bytes = <int>[];
-    await for (final chunk in store.readStream(tempDir.path, key2, extension: ext)) {
+    await for (final chunk in store.readStream(key2, extension: ext)) {
       key2Bytes.addAll(chunk);
     }
     expect(utf8.decode(key2Bytes), contains('second'));
@@ -428,7 +428,7 @@ void main() {
 
       // Read back to verify content
       final readData = <int>[];
-      await for (final chunk in store0.readStream(tempDir0.path, key, extension: ext)) {
+      await for (final chunk in store0.readStream(key, extension: ext)) {
         readData.addAll(chunk);
       }
       expect(utf8.decode(readData), equals(content));
@@ -469,7 +469,7 @@ void main() {
 
       // Read back to verify content
       final readData = <int>[];
-      await for (final chunk in store1.readStream(tempDir1.path, key, extension: ext)) {
+      await for (final chunk in store1.readStream(key, extension: ext)) {
         readData.addAll(chunk);
       }
       expect(utf8.decode(readData), equals(content));
@@ -516,7 +516,7 @@ void main() {
 
       // Read back to verify content
       final readData = <int>[];
-      await for (final chunk in store2.readStream(tempDir2.path, key, extension: ext)) {
+      await for (final chunk in store2.readStream(key, extension: ext)) {
         readData.addAll(chunk);
       }
       expect(utf8.decode(readData), equals(content));

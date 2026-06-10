@@ -221,11 +221,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
         _downloadStatus = 'Reading file...';
       });
 
-      final readStream = _store!.readStream(
-        _storagePath!,
-        key,
-        extension: extension,
-      );
+      final readStream = _store!.readStream(key, extension: extension);
       final bytes = <int>[];
       await for (final chunk in readStream) {
         bytes.addAll(chunk);

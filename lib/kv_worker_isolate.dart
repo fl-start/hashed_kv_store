@@ -12,6 +12,7 @@ class _WriteContext {
   final String ext;
   final File targetFile;
   final File? tempFile;
+  DateTime lastFlushAt;
 
   _WriteContext({
     required this.sink,
@@ -19,6 +20,7 @@ class _WriteContext {
     required this.ext,
     required this.targetFile,
     this.tempFile,
+    required this.lastFlushAt,
   });
 }
 
@@ -27,12 +29,14 @@ class _QueuedWrite {
   final String ext;
   final bool truncate;
   final SendPort replyPort;
+  final String? filePath;
 
   _QueuedWrite({
     required this.key,
     required this.ext,
     required this.truncate,
     required this.replyPort,
+    this.filePath,
   });
 }
 
@@ -40,11 +44,13 @@ class _QueuedDelete {
   final String key;
   final String ext;
   final SendPort replyPort;
+  final String? filePath;
 
   _QueuedDelete({
     required this.key,
     required this.ext,
     required this.replyPort,
+    this.filePath,
   });
 }
 
@@ -63,15 +69,6 @@ List<int> _chunkFromMessage(Object? raw) {
   return (raw as List).cast<int>();
 }
 
-/// Write worker isolate entry function.
-///
-/// args:
-/// - args[0] : String rootDirPath
-/// - args[1] : SendPort initPort (router uses this to get our SendPort)
-/// - args[2] : int idlePurgeMs
-/// - args[3] : int folderHierarchyLevels (default: 1)
-/// - args[4] : int workerIndex
-/// - args[5] : SendPort routerControlPort (worker lifecycle)
 void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
   final String rootDirPath = args[0] as String;
   final SendPort initPort = args[1] as SendPort;
@@ -80,6 +77,9 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
   final int workerIndex = (args.length > 4 ? args[4] as int : 0);
   final SendPort? routerControlPort =
       args.length > 5 ? args[5] as SendPort : null;
+  final bool fsyncOnClose = (args.length > 6 ? args[6] as bool : false);
+  final int flushThresholdBytes = (args.length > 7 ? args[7] as int : 65536);
+  final int flushIntervalMs = (args.length > 8 ? args[8] as int : 100);
 
   final cmdPort = ReceivePort();
   initPort.send(cmdPort.sendPort);
@@ -89,6 +89,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
   final pendingWritesForKey = <String, List<_QueuedWrite>>{};
   final pendingDeletesForKey = <String, List<_QueuedDelete>>{};
   final writes = <int, _WriteContext>{};
+  final creditPortsForWrite = <int, SendPort>{};
 
   var nextWriteId = 1;
   var anyActivityRecent = true;
@@ -96,7 +97,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
 
   String chanId(String key, String ext) => '$key::$ext';
 
-  File fileFor(String key, String extension) {
+  File fileFor(String key, String extension, {String? filePath}) {
+    if (filePath != null) return File(filePath);
     return File(
       HashedKvPath.pathForKey(
         rootDirPath,
@@ -107,10 +109,21 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     );
   }
 
-  Future<void> deleteKey(String key, String extension) async {
-    final file = fileFor(key, extension);
+  Future<void> deleteKey(String key, String extension, {String? filePath}) async {
+    final file = fileFor(key, extension, filePath: filePath);
     if (await file.exists()) {
       await file.delete();
+    }
+  }
+
+  Future<void> syncFile(File file) async {
+    if (!fsyncOnClose) return;
+    RandomAccessFile? raf;
+    try {
+      raf = await file.open(mode: FileMode.read);
+      await raf.flush();
+    } finally {
+      await raf?.close();
     }
   }
 
@@ -127,6 +140,15 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     if (subs == null) return;
     for (final sp in subs) {
       sp.send(null);
+    }
+  }
+
+  Future<void> maybeFlush(_WriteContext ctx, int chunkLength) async {
+    final now = DateTime.now();
+    if (chunkLength >= flushThresholdBytes ||
+        now.difference(ctx.lastFlushAt).inMilliseconds >= flushIntervalMs) {
+      await ctx.sink.flush();
+      ctx.lastFlushAt = now;
     }
   }
 
@@ -166,8 +188,10 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     required String ext,
     required bool truncate,
     required int writeId,
+    String? filePath,
   }) async {
-    final targetFile = fileFor(key, ext);
+    final targetFile = fileFor(key, ext, filePath: filePath);
+    final now = DateTime.now();
     if (truncate) {
       final tempFile = File('${targetFile.path}.$writeId.tmp');
       final sink = tempFile.openWrite();
@@ -177,6 +201,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         ext: ext,
         targetFile: targetFile,
         tempFile: tempFile,
+        lastFlushAt: now,
       );
     }
 
@@ -186,17 +211,23 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
       key: key,
       ext: ext,
       targetFile: targetFile,
+      lastFlushAt: now,
     );
   }
 
   Future<void> completeWriteContext(_WriteContext ctx) async {
     await ctx.sink.flush();
     await ctx.sink.close();
+
     if (ctx.tempFile != null) {
+      await syncFile(ctx.tempFile!);
       if (await ctx.targetFile.exists()) {
         await ctx.targetFile.delete();
       }
       await ctx.tempFile!.rename(ctx.targetFile.path);
+      await syncFile(ctx.targetFile);
+    } else {
+      await syncFile(ctx.targetFile);
     }
   }
 
@@ -207,7 +238,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     while (queue.isNotEmpty) {
       final next = queue.removeAt(0);
       try {
-        await deleteKey(next.key, next.ext);
+        await deleteKey(next.key, next.ext, filePath: next.filePath);
         _sendOk(next.replyPort);
       } catch (e) {
         _sendError(next.replyPort, e);
@@ -234,6 +265,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         ext: next.ext,
         truncate: next.truncate,
         writeId: newWriteId,
+        filePath: next.filePath,
       );
       writes[newWriteId] = ctx;
       next.replyPort.send(<String, dynamic>{
@@ -289,6 +321,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           final ext = cmd['ext'] as String;
           final truncate = cmd['truncate'] as bool? ?? true;
           final replyPort = cmd['replyPort'] as SendPort;
+          final filePath = cmd['filePath'] as String?;
           final k = chanId(key, ext);
           final active = activeWriteIdForKey[k];
 
@@ -301,6 +334,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
                   ext: ext,
                   truncate: truncate,
                   replyPort: replyPort,
+                  filePath: filePath,
                 ));
             scheduleIdleCheckIfNeeded();
             break;
@@ -315,6 +349,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
               ext: ext,
               truncate: truncate,
               writeId: writeId,
+              filePath: filePath,
             );
             writes[writeId] = ctx;
             replyPort.send(<String, dynamic>{
@@ -329,6 +364,13 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         }
         break;
 
+      case 'registerCredits':
+        {
+          final writeId = cmd['writeId'] as int;
+          creditPortsForWrite[writeId] = cmd['creditPort'] as SendPort;
+        }
+        break;
+
       case 'writeChunk':
         {
           final writeId = cmd['writeId'] as int;
@@ -338,11 +380,11 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           try {
             final chunk = _chunkFromMessage(cmd['chunk']);
             ctx.sink.add(chunk);
-            if (chunk.length > 64 * 1024) {
-              await ctx.sink.flush();
-            }
+            await maybeFlush(ctx, chunk.length);
             notifySubscribers(ctx.key, ctx.ext, chunk);
+            creditPortsForWrite[writeId]?.send(null);
           } catch (e) {
+            creditPortsForWrite.remove(writeId);
             writes.remove(writeId);
             await cleanupWriteContext(ctx);
             await failChannel(ctx.key, ctx.ext, e);
@@ -355,6 +397,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         {
           final writeId = cmd['writeId'] as int;
           final replyPort = cmd['replyPort'] as SendPort?;
+          creditPortsForWrite.remove(writeId);
           final ctx = writes.remove(writeId);
           if (ctx == null) {
             _sendError(replyPort, StateError('unknown writeId: $writeId'));
@@ -382,6 +425,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
       case 'writeAbort':
         {
           final writeId = cmd['writeId'] as int;
+          creditPortsForWrite.remove(writeId);
           final ctx = writes.remove(writeId);
           if (ctx == null) break;
 
@@ -396,6 +440,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           final key = cmd['key'] as String;
           final ext = cmd['ext'] as String;
           final replyPort = cmd['replyPort'] as SendPort?;
+          final filePath = cmd['filePath'] as String?;
           final k = chanId(key, ext);
           final hasActiveWrite = activeWriteIdForKey[k] != null;
           final hasPendingWrites = pendingWritesForKey[k]?.isNotEmpty ?? false;
@@ -407,13 +452,14 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
                   key: key,
                   ext: ext,
                   replyPort: replyPort!,
+                  filePath: filePath,
                 ));
             scheduleIdleCheckIfNeeded();
             break;
           }
 
           try {
-            await deleteKey(key, ext);
+            await deleteKey(key, ext, filePath: filePath);
             _sendOk(replyPort);
           } catch (e) {
             _sendError(replyPort, e);

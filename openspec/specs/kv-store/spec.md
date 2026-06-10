@@ -129,6 +129,24 @@ The system SHALL delete a key's file if present and complete the caller's `delet
 - **WHEN** a delete is requested while a write is active for the same key
 - **THEN** the delete runs after the active write completes
 
+### Requirement: Optional Fsync On Close
+
+The system SHALL support an optional `fsyncOnClose` spawn parameter (default false) that fsyncs file data before acknowledging completed writes.
+
+#### Scenario: Fsync disabled by default
+
+- **WHEN** a write completes with default spawn settings
+- **THEN** the write is acknowledged after flush and close without fsync
+
+### Requirement: Write Backpressure
+
+The system SHALL limit in-flight write chunks per session using a configurable credit window (`writeMaxInFlightChunks`, default 8).
+
+#### Scenario: Producer backpressure
+
+- **WHEN** the client has sent the maximum allowed in-flight chunks for a write
+- **THEN** it waits for worker credit before sending additional chunks
+
 ### Requirement: Multi-Isolate Write Architecture
 
 The system SHALL use a router isolate, a master folder isolate, and a configurable pool of write worker isolates sharded by key.
