@@ -390,7 +390,7 @@ void main() {
   });
 
   test('folder hierarchy level 2 stores files in two folders', () async {
-    // Test with 2 folder levels (default/current behavior)
+    // Test with 2 folder levels (opt-in; default is 1)
     final tempDir2 = await Directory.systemTemp.createTemp('hashed_kv_test_h2_');
     try {
       final store2 = await MultiIsolateKvStoreClient.spawn(

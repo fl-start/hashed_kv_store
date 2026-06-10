@@ -4,7 +4,7 @@ A SHA256-based key/value store with streaming IO and multi-isolate support for D
 
 ## Features
 
-- **SHA256-based storage**: Keys are hashed using SHA256 and stored in a two-level folder structure (`<cc>/<cc>/<cccc-cccc-cccc-cccc>.<ext>`)
+- **SHA256-based storage**: Keys are hashed using SHA256 and stored under a single folder by default (`<cc>/<cccc-cccc-cccc-cccc>.<ext>`). Optional two-level nesting (`<cc>/<cc>/<...>`) is available via `folderHierarchyLevels: 2`.
 - **Streaming interfaces**: Both read and write operations use streams for efficient handling of large files
 - **Multi-isolate architecture**: 
   - Router isolate manages multiple write workers
@@ -59,6 +59,19 @@ void main() async {
   print('Read back: $readJson');
 }
 ```
+
+### Folder hierarchy (default: 1 level)
+
+By default, files are stored one folder deep under the root (`<cc>/<file>`). To use two nested folders, pass `folderHierarchyLevels: 2` when spawning the store:
+
+```dart
+final store = await MultiIsolateKvStoreClient.spawn(
+  rootDirPath: './kv_root',
+  folderHierarchyLevels: 2, // override default of 1
+);
+```
+
+Flutter apps can define a constant (see `example/lib/main.dart`) and pass it to `spawn` so the nesting depth is configured in one place.
 
 ### Live subscription (tail -f style)
 

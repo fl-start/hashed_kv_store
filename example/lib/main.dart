@@ -7,6 +7,12 @@ import 'package:flutter/material.dart';
 import 'package:hashed_kv_store/hashed_kv_store.dart';
 import 'package:path_provider/path_provider.dart';
 
+/// Folder nesting for stored files when spawning [MultiIsolateKvStoreClient].
+///
+/// Use `1` for the package default (one subdirectory under the root).
+/// Set to `2` for two nested folder levels when your app needs deeper sharding.
+const int kFolderHierarchyLevels = 1;
+
 void main() {
   runApp(const MyApp());
 }
@@ -101,6 +107,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
       _store = await MultiIsolateKvStoreClient.spawn(
         rootDirPath: storageDir.path,
         numWriteWorkers: 4,
+        folderHierarchyLevels: kFolderHierarchyLevels,
       );
 
       setState(() {
@@ -338,6 +345,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
                   ),
                   const SizedBox(height: 8),
                   Text('Path: $_storagePath'),
+                  Text('Folder hierarchy levels: $kFolderHierarchyLevels'),
                   const SizedBox(height: 8),
                   if (_downloadStatus != null)
                     Text(
