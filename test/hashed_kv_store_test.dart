@@ -421,7 +421,7 @@ void main() {
       // Verify file is stored directly in root (no subdirectories)
       final files = await tempDir0.list(recursive: false).toList();
       expect(
-        files.where((f) => f is File),
+        files.whereType<File>(),
         isNotEmpty,
         reason: 'Should have files in root directory',
       );
@@ -525,6 +525,107 @@ void main() {
     } catch (e) {
       await tempDir2.delete(recursive: true);
       rethrow;
+    }
+  });
+
+  test('client exposes rootDirPath and pathForKey', () {
+    expect(store.rootDirPath, equals(tempDir.path));
+    final path = store.pathForKey('some:key', extension: 'bin');
+    expect(path, startsWith(tempDir.path));
+  });
+
+  test('readStreamAt reads from explicit root path', () async {
+    const key = 'read:at';
+    const ext = 'txt';
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('explicit')),
+      extension: ext,
+    );
+
+    final bytes = <int>[];
+    await for (final chunk in store.readStreamAt(tempDir.path, key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals('explicit'));
+  });
+
+  test('input stream error aborts write and preserves prior content', () async {
+    const key = 'stream:error';
+    const ext = 'txt';
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('preserved')),
+      extension: ext,
+    );
+
+    final controller = StreamController<List<int>>();
+    final writeFuture = store.writeFromStream(key, controller.stream, extension: ext);
+    controller.add(utf8.encode('partial'));
+
+    final expectation = expectLater(writeFuture, throwsA(isA<StateError>()));
+    controller.addError(StateError('stream failed'));
+    await controller.close();
+    await expectation;
+
+    final bytes = <int>[];
+    await for (final chunk in store.readStream(key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals('preserved'));
+  });
+
+  test('write to invalid storage root throws KvWriteException', () async {
+    final blocker = File('${tempDir.path}/blocker');
+    await blocker.writeAsString('not a directory');
+
+    final badStore = await MultiIsolateKvStoreClient.spawn(
+      rootDirPath: blocker.path,
+      numWriteWorkers: 1,
+    );
+
+    await expectLater(
+      badStore.writeFromStream(
+        'fail:key',
+        Stream.value([1, 2, 3]),
+      ),
+      throwsA(isA<KvWriteException>()),
+    );
+  });
+
+  test('worker respawns after idle purge and accepts new writes', () async {
+    final purgeDir = await Directory.systemTemp.createTemp('hashed_kv_purge_');
+    try {
+      final purgeStore = await MultiIsolateKvStoreClient.spawn(
+        rootDirPath: purgeDir.path,
+        numWriteWorkers: 1,
+        writeIdlePurgeDuration: const Duration(milliseconds: 100),
+      );
+
+      await purgeStore.writeFromStream(
+        'warmup',
+        Stream.value(utf8.encode('warm')),
+        extension: 'txt',
+      );
+
+      await Future.delayed(const Duration(milliseconds: 400));
+
+      await purgeStore.writeFromStream(
+        'after:purge',
+        Stream.value(utf8.encode('ok')),
+        extension: 'txt',
+      );
+
+      final bytes = <int>[];
+      await for (final chunk in purgeStore.readStream('after:purge', extension: 'txt')) {
+        bytes.addAll(chunk);
+      }
+      expect(utf8.decode(bytes), equals('ok'));
+    } finally {
+      if (await purgeDir.exists()) {
+        await purgeDir.delete(recursive: true);
+      }
     }
   });
 }
