@@ -1,0 +1,61 @@
+import 'dart:isolate';
+
+/// Thrown when a value for a given key does not exist on disk.
+class KvNotFoundException implements Exception {
+  final String key;
+  final String extension;
+
+  KvNotFoundException(this.key, this.extension);
+
+  @override
+  String toString() =>
+      'KvNotFoundException: No value found for key="$key" (.$extension)';
+}
+
+/// Thrown when a write operation fails in a worker or folder isolate.
+class KvWriteException implements Exception {
+  final String message;
+  final String? type;
+  final String? stackTrace;
+
+  KvWriteException(
+    this.message, {
+    this.type,
+    this.stackTrace,
+  });
+
+  @override
+  String toString() {
+    final buffer = StringBuffer('KvWriteException: $message');
+    if (type != null) {
+      buffer.write(' ($type)');
+    }
+    if (stackTrace != null) {
+      buffer.write('\n$stackTrace');
+    }
+    return buffer.toString();
+  }
+}
+
+void kvSendError(SendPort? port, Object error, [StackTrace? stackTrace]) {
+  port?.send(<String, dynamic>{
+    'error': error.toString(),
+    'type': error.runtimeType.toString(),
+    if (stackTrace != null) 'stackTrace': stackTrace.toString(),
+  });
+}
+
+void kvSendOk(SendPort? port, [Map<String, dynamic>? extra]) {
+  port?.send(<String, dynamic>{'ok': true, ...?extra});
+}
+
+void kvThrowIfError(Map<dynamic, dynamic> response) {
+  final error = response['error'];
+  if (error != null) {
+    throw KvWriteException(
+      error.toString(),
+      type: response['type'] as String?,
+      stackTrace: response['stackTrace'] as String?,
+    );
+  }
+}

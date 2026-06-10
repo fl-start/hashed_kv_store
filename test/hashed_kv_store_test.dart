@@ -23,8 +23,7 @@ void main() {
   });
 
   tearDown(() async {
-    // Give isolates time to finish
-    await Future.delayed(const Duration(milliseconds: 200));
+    await store.close();
     if (await tempDir.exists()) {
       try {
         await tempDir.delete(recursive: true);
@@ -598,6 +597,7 @@ void main() {
       ),
       throwsA(isA<KvWriteException>()),
     );
+    await badStore.close();
   });
 
   test('worker respawns after idle purge and accepts new writes', () async {
@@ -629,6 +629,7 @@ void main() {
         bytes.addAll(chunk);
       }
       expect(utf8.decode(bytes), equals('ok'));
+      await purgeStore.close();
     } finally {
       if (await purgeDir.exists()) {
         await purgeDir.delete(recursive: true);
@@ -659,6 +660,7 @@ void main() {
       bytes.addAll(chunk);
     }
     expect(utf8.decode(bytes), equals(List.generate(32, (i) => '$i\n').join()));
+    await smallWindowStore.close();
   });
 
   test('truncate commit never exposes missing or partial content', () async {
@@ -680,23 +682,21 @@ void main() {
       extension: ext,
     );
 
-    controller.add(utf8.encode(newContent));
-    final closeFuture = controller.close();
-
-    var sawNew = false;
-    for (var i = 0; i < 50 && !sawNew; i++) {
-      final bytes = <int>[];
-      await for (final chunk in store.readStream(key, extension: ext)) {
-        bytes.addAll(chunk);
-      }
-      final content = utf8.decode(bytes);
-      expect(content, anyOf(oldContent, newContent));
-      sawNew = content == newContent;
-      await Future.delayed(const Duration(milliseconds: 5));
+    final midBytes = <int>[];
+    await for (final chunk in store.readStream(key, extension: ext)) {
+      midBytes.addAll(chunk);
     }
+    expect(utf8.decode(midBytes), equals(oldContent));
 
-    await closeFuture;
+    controller.add(utf8.encode(newContent));
+    await controller.close();
     await writeFuture;
+
+    final finalBytes = <int>[];
+    await for (final chunk in store.readStream(key, extension: ext)) {
+      finalBytes.addAll(chunk);
+    }
+    expect(utf8.decode(finalBytes), equals(newContent));
   });
 
   test('spawn validates public parameters', () async {
@@ -735,5 +735,180 @@ void main() {
       ),
       throwsArgumentError,
     );
+    await expectLater(
+      () => MultiIsolateKvStoreClient.spawn(
+        rootDirPath: tempDir.path,
+        writeIdlePurgeDuration: const Duration(milliseconds: -1),
+      ),
+      throwsArgumentError,
+    );
+    await expectLater(
+      () => MultiIsolateKvStoreClient.spawn(
+        rootDirPath: '',
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('credit registration handles default window with many chunks', () async {
+    final creditStore = await MultiIsolateKvStoreClient.spawn(
+      rootDirPath: tempDir.path,
+      numWriteWorkers: 1,
+      writeMaxInFlightChunks: 8,
+    );
+
+    const key = 'credit:race';
+    const ext = 'bin';
+    final chunks = List.generate(32, (i) => utf8.encode('c$i'));
+
+    await creditStore.writeFromStream(
+      key,
+      Stream<List<int>>.fromIterable(chunks),
+      extension: ext,
+    );
+
+    final bytes = <int>[];
+    await for (final chunk in creditStore.readStream(key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals(chunks.map(utf8.decode).join()));
+    await creditStore.close();
+  });
+
+  test('delete completes after worker idle purge respawn', () async {
+    final purgeDir = await Directory.systemTemp.createTemp('delete_purge_');
+    try {
+      final purgeStore = await MultiIsolateKvStoreClient.spawn(
+        rootDirPath: purgeDir.path,
+        numWriteWorkers: 1,
+        writeIdlePurgeDuration: const Duration(milliseconds: 100),
+      );
+
+      await purgeStore.writeFromStream(
+        'del:key',
+        Stream.value(utf8.encode('x')),
+        extension: 'txt',
+      );
+      await Future.delayed(const Duration(milliseconds: 400));
+
+      await purgeStore.delete('del:key', extension: 'txt');
+
+      expect(
+        () async =>
+            await purgeStore.readStream('del:key', extension: 'txt').drain(),
+        throwsA(isA<KvNotFoundException>()),
+      );
+      await purgeStore.close();
+    } finally {
+      if (await purgeDir.exists()) {
+        await purgeDir.delete(recursive: true);
+      }
+    }
+  });
+
+  test('writeAbort allows queued write to proceed', () async {
+    const key = 'abort:queue';
+    const ext = 'txt';
+
+    final controllerA = StreamController<List<int>>();
+    final writeA = store.writeFromStream(key, controllerA.stream, extension: ext);
+    controllerA.add(utf8.encode('partial'));
+
+    final writeB = store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('queued-ok')),
+      extension: ext,
+    );
+
+    final abortExpect = expectLater(writeA, throwsA(isA<StateError>()));
+    controllerA.addError(StateError('abort'));
+    await controllerA.close();
+    await abortExpect;
+
+    await writeB;
+
+    final bytes = <int>[];
+    await for (final chunk in store.readStream(key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals('queued-ok'));
+  });
+
+  test('close prevents further write and delete operations', () async {
+    await store.close();
+
+    await expectLater(
+      store.writeFromStream('k', Stream.value([1])),
+      throwsA(isA<StateError>()),
+    );
+    await expectLater(
+      store.delete('k'),
+      throwsA(isA<StateError>()),
+    );
+    expect(store.isClosed, isTrue);
+  });
+
+  test('fsyncOnClose accepts writes', () async {
+    final fsyncStore = await MultiIsolateKvStoreClient.spawn(
+      rootDirPath: tempDir.path,
+      numWriteWorkers: 1,
+      fsyncOnClose: true,
+    );
+
+    await fsyncStore.writeFromStream(
+      'fsync:key',
+      Stream.value(utf8.encode('synced')),
+      extension: 'txt',
+    );
+
+    final bytes = <int>[];
+    await for (final chunk in fsyncStore.readStream('fsync:key', extension: 'txt')) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals('synced'));
+    await fsyncStore.close();
+  });
+
+  test('live subscription survives worker respawn', () async {
+    final purgeDir = await Directory.systemTemp.createTemp('live_purge_');
+    try {
+      final purgeStore = await MultiIsolateKvStoreClient.spawn(
+        rootDirPath: purgeDir.path,
+        numWriteWorkers: 1,
+        writeIdlePurgeDuration: const Duration(milliseconds: 100),
+      );
+
+      final received = <List<int>>[];
+      final sub = purgeStore
+          .subscribeLive('live:respawn', extension: 'txt')
+          .listen(received.add);
+
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      await purgeStore.writeFromStream(
+        'warmup',
+        Stream.value(utf8.encode('warm')),
+        extension: 'txt',
+      );
+      await Future.delayed(const Duration(milliseconds: 400));
+
+      await purgeStore.writeFromStream(
+        'live:respawn',
+        Stream.value(utf8.encode('after-respawn')),
+        extension: 'txt',
+      );
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      expect(received, isNotEmpty);
+      final content = utf8.decode(received.expand((c) => c).toList());
+      expect(content, contains('after-respawn'));
+
+      await sub.cancel();
+      await purgeStore.close();
+    } finally {
+      if (await purgeDir.exists()) {
+        await purgeDir.delete(recursive: true);
+      }
+    }
   });
 }

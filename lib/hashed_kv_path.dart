@@ -43,7 +43,70 @@ class HashedKvPath {
     String extension,
     int hierarchyLevels,
   ) {
+    return _relativePathFromDigest(
+      crockfordBase32ForKey(key),
+      extension,
+      hierarchyLevels,
+    );
+  }
+
+  /// Absolute file path for [key] under [rootDirPath].
+  static String pathForKey(
+    String rootDirPath,
+    String key,
+    String extension,
+    int hierarchyLevels,
+  ) {
+    return pathsForKey(
+      rootDirPath,
+      key,
+      extension,
+      hierarchyLevels,
+    ).filePath;
+  }
+
+  /// Folder path that must exist before writing [key].
+  static String folderPathForKey(
+    String rootDirPath,
+    String key,
+    int hierarchyLevels,
+  ) {
+    return pathsForKey(
+      rootDirPath,
+      key,
+      '',
+      hierarchyLevels,
+    ).folderPath;
+  }
+
+  /// Folder and file paths for [key], computed from a single digest.
+  static ({String folderPath, String filePath}) pathsForKey(
+    String rootDirPath,
+    String key,
+    String extension,
+    int hierarchyLevels,
+  ) {
     final digestBase32 = crockfordBase32ForKey(key);
+    final relative = _relativePathFromDigest(
+      digestBase32,
+      extension,
+      hierarchyLevels,
+    );
+    return (
+      folderPath: _folderPathFromDigest(
+        rootDirPath,
+        digestBase32,
+        hierarchyLevels,
+      ),
+      filePath: p.join(rootDirPath, relative),
+    );
+  }
+
+  static String _relativePathFromDigest(
+    String digestBase32,
+    String extension,
+    int hierarchyLevels,
+  ) {
     final stem = digestBase32.substring(4, 20);
     final fileStem =
         '${stem.substring(0, 4)}-${stem.substring(4, 8)}-${stem.substring(8, 12)}-${stem.substring(12, 16)}';
@@ -63,35 +126,18 @@ class HashedKvPath {
     }
   }
 
-  /// Absolute file path for [key] under [rootDirPath].
-  static String pathForKey(
+  static String _folderPathFromDigest(
     String rootDirPath,
-    String key,
-    String extension,
-    int hierarchyLevels,
-  ) {
-    return p.join(
-      rootDirPath,
-      relativePathForKey(key, extension, hierarchyLevels),
-    );
-  }
-
-  /// Folder path that must exist before writing [key].
-  static String folderPathForKey(
-    String rootDirPath,
-    String key,
+    String digestBase32,
     int hierarchyLevels,
   ) {
     if (hierarchyLevels == 0) {
       return rootDirPath;
     }
-
-    final digestBase32 = crockfordBase32ForKey(key);
     if (hierarchyLevels == 1) {
       final level1 = digestBase32.substring(0, 2);
       return p.join(rootDirPath, level1);
     }
-
     final level1 = digestBase32.substring(0, 2);
     final level2 = digestBase32.substring(2, 4);
     return p.join(rootDirPath, level1, level2);

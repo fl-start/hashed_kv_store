@@ -147,6 +147,52 @@ The system SHALL limit in-flight write chunks per session using a configurable c
 - **WHEN** the client has sent the maximum allowed in-flight chunks for a write
 - **THEN** it waits for worker credit before sending additional chunks
 
+#### Scenario: Credit registration before chunks
+
+- **WHEN** a write session registers its credit port
+- **THEN** the worker acknowledges registration before the client sends write chunks
+
+### Requirement: Client Lifecycle
+
+The system SHALL provide `close()` on [MultiIsolateKvStoreClient] to shut down router, worker, and folder isolates. After close, write, delete, and subscribe operations SHALL fail fast.
+
+#### Scenario: Close shuts down isolates
+
+- **WHEN** a caller invokes `close()` on a store client
+- **THEN** subsequent `writeFromStream` and `delete` calls throw `StateError`
+
+### Requirement: Worker Respawn Resilience
+
+The system SHALL wait for write workers to become available during respawn and SHALL re-register live subscriptions after a worker respawns.
+
+#### Scenario: Delete after worker respawn
+
+- **WHEN** a delete is requested after a worker has respawned from idle purge
+- **THEN** the delete future completes successfully
+
+#### Scenario: Live subscription after worker respawn
+
+- **WHEN** a live subscription is active across a worker respawn
+- **THEN** the subscriber continues to receive chunks from subsequent writes
+
+### Requirement: Write Abort Queue Semantics
+
+When an active write is aborted, the system SHALL clean up the aborted write and SHALL allow queued writes for the same key to proceed.
+
+#### Scenario: Queued write after abort
+
+- **WHEN** a second write is queued behind an active write and the active write is aborted
+- **THEN** the queued write completes successfully
+
+### Requirement: Append Write Visibility
+
+Append writes (`truncateExisting: false`) SHALL write directly to the target file and are not atomic. Readers MAY observe partial appended content during an in-progress append.
+
+#### Scenario: Append is non-atomic
+
+- **WHEN** a caller appends to an existing key
+- **THEN** the write does not use temp-file rename semantics
+
 ### Requirement: Multi-Isolate Write Architecture
 
 The system SHALL use a router isolate, a master folder isolate, and a configurable pool of write worker isolates sharded by key.

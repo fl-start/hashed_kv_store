@@ -18,7 +18,7 @@ void main() {
     });
 
     tearDown(() async {
-      await Future.delayed(const Duration(milliseconds: 100));
+      await store.close();
       if (await tempDir.exists()) {
         await tempDir.delete(recursive: true);
       }
@@ -51,6 +51,19 @@ void main() {
       final a = store.pathForKey(key, extension: 'a');
       final b = store.pathForKey(key, extension: 'b');
       expect(a, isNot(equals(b)));
+    });
+  });
+
+  group('HashedKvPath.pathsForKey', () {
+    test('folder and file paths share one digest', () {
+      const root = '/data';
+      const key = 'digest:test';
+      final paths = HashedKvPath.pathsForKey(root, key, 'bin', 1);
+      expect(paths.filePath, equals(HashedKvPath.pathForKey(root, key, 'bin', 1)));
+      expect(
+        paths.folderPath,
+        equals(HashedKvPath.folderPathForKey(root, key, 1)),
+      );
     });
   });
 

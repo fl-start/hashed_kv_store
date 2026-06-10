@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'hashed_kv_path.dart';
+import 'kv_exceptions.dart';
 
 typedef _Cmd = Map<String, dynamic>;
 
@@ -52,14 +54,6 @@ class _QueuedDelete {
     required this.replyPort,
     this.filePath,
   });
-}
-
-void _sendError(SendPort? port, Object error) {
-  port?.send(<String, dynamic>{'error': error.toString()});
-}
-
-void _sendOk(SendPort? port) {
-  port?.send(<String, dynamic>{'ok': true});
 }
 
 List<int> _chunkFromMessage(Object? raw) {
@@ -123,6 +117,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     try {
       raf = await file.open(mode: FileMode.read);
       await raf.flush();
+    } catch (_) {
+      // Best-effort flush; some platforms reject flush on temp/read handles.
     } finally {
       await raf?.close();
     }
@@ -131,8 +127,10 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
   void notifySubscribers(String key, String ext, List<int> chunk) {
     final subs = subscribers[chanId(key, ext)];
     if (subs == null) return;
+    final bytes = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+    final transferable = TransferableTypedData.fromList([bytes]);
     for (final sp in subs) {
-      sp.send(chunk);
+      sp.send(transferable);
     }
   }
 
@@ -173,12 +171,12 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
 
     final queuedWrites = pendingWritesForKey.remove(k) ?? [];
     for (final queued in queuedWrites) {
-      _sendError(queued.replyPort, error);
+      kvSendError(queued.replyPort, error);
     }
 
     final queuedDeletes = pendingDeletesForKey.remove(k) ?? [];
     for (final queued in queuedDeletes) {
-      _sendError(queued.replyPort, error);
+      kvSendError(queued.replyPort, error);
     }
 
     endChannel(key, ext);
@@ -264,9 +262,9 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
       final next = queue.removeAt(0);
       try {
         await deleteKey(next.key, next.ext, filePath: next.filePath);
-        _sendOk(next.replyPort);
-      } catch (e) {
-        _sendError(next.replyPort, e);
+        kvSendOk(next.replyPort);
+      } catch (e, st) {
+        kvSendError(next.replyPort, e, st);
       }
     }
     pendingDeletesForKey.remove(k);
@@ -297,9 +295,9 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         'writeId': newWriteId,
         'workerPort': cmdPort.sendPort,
       });
-    } catch (e) {
+    } catch (e, st) {
       activeWriteIdForKey[k] = null;
-      _sendError(next.replyPort, e);
+      kvSendError(next.replyPort, e, st);
       await startQueuedWrite(k);
     }
   }
@@ -341,6 +339,10 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     anyActivityRecent = true;
 
     switch (type) {
+      case 'shutdown':
+        kvSendOk(cmd['replyPort'] as SendPort?);
+        Isolate.exit();
+
       case 'openWrite':
         {
           final key = cmd['key'] as String;
@@ -381,9 +383,10 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
               'writeId': writeId,
               'workerPort': cmdPort.sendPort,
             });
-          } catch (e) {
+          } catch (e, st) {
             activeWriteIdForKey[k] = null;
-            _sendError(replyPort, e);
+            kvSendError(replyPort, e, st);
+            await startQueuedWrite(k);
           }
           scheduleIdleCheckIfNeeded();
         }
@@ -393,6 +396,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         {
           final writeId = cmd['writeId'] as int;
           creditPortsForWrite[writeId] = cmd['creditPort'] as SendPort;
+          final replyPort = cmd['replyPort'] as SendPort?;
+          kvSendOk(replyPort);
         }
         break;
 
@@ -425,23 +430,23 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           creditPortsForWrite.remove(writeId);
           final ctx = writes.remove(writeId);
           if (ctx == null) {
-            _sendError(replyPort, StateError('unknown writeId: $writeId'));
+            kvSendError(replyPort, StateError('unknown writeId: $writeId'));
             break;
           }
 
           try {
             await completeWriteContext(ctx);
             endChannel(ctx.key, ctx.ext);
-            _sendOk(replyPort);
+            kvSendOk(replyPort);
 
             final k = chanId(ctx.key, ctx.ext);
             activeWriteIdForKey[k] = null;
             await processPendingDeletes(k);
             await startQueuedWrite(k);
-          } catch (e) {
+          } catch (e, st) {
             await cleanupWriteContext(ctx);
             await failChannel(ctx.key, ctx.ext, e);
-            _sendError(replyPort, e);
+            kvSendError(replyPort, e, st);
           }
           scheduleIdleCheckIfNeeded();
         }
@@ -455,7 +460,10 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           if (ctx == null) break;
 
           await cleanupWriteContext(ctx);
-          await failChannel(ctx.key, ctx.ext, StateError('write aborted'));
+          final k = chanId(ctx.key, ctx.ext);
+          activeWriteIdForKey[k] = null;
+          await processPendingDeletes(k);
+          await startQueuedWrite(k);
           scheduleIdleCheckIfNeeded();
         }
         break;
@@ -485,9 +493,9 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
 
           try {
             await deleteKey(key, ext, filePath: filePath);
-            _sendOk(replyPort);
-          } catch (e) {
-            _sendError(replyPort, e);
+            kvSendOk(replyPort);
+          } catch (e, st) {
+            kvSendError(replyPort, e, st);
           }
           scheduleIdleCheckIfNeeded();
         }

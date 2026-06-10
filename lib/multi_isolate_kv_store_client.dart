@@ -4,36 +4,10 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'hashed_kv_path.dart';
+import 'kv_exceptions.dart';
 import 'kv_router_isolate.dart';
 
-/// Thrown when a value for a given key does not exist on disk.
-class KvNotFoundException implements Exception {
-  final String key;
-  final String extension;
-
-  KvNotFoundException(this.key, this.extension);
-
-  @override
-  String toString() =>
-      'KvNotFoundException: No value found for key="$key" (.$extension)';
-}
-
-/// Thrown when a write operation fails in a worker or folder isolate.
-class KvWriteException implements Exception {
-  final String message;
-
-  KvWriteException(this.message);
-
-  @override
-  String toString() => 'KvWriteException: $message';
-}
-
-void _throwIfError(Map<dynamic, dynamic> response) {
-  final error = response['error'];
-  if (error != null) {
-    throw KvWriteException(error.toString());
-  }
-}
+export 'kv_exceptions.dart';
 
 /// Public client API for the multi-isolate KV store.
 class MultiIsolateKvStoreClient {
@@ -41,6 +15,7 @@ class MultiIsolateKvStoreClient {
   final String _rootDirPath;
   final int _folderHierarchyLevels;
   final int _writeMaxInFlightChunks;
+  bool _closed = false;
 
   MultiIsolateKvStoreClient._(
     this._routerPort,
@@ -51,6 +26,15 @@ class MultiIsolateKvStoreClient {
 
   /// Root directory where KV files are stored (from [spawn]).
   String get rootDirPath => _rootDirPath;
+
+  /// Whether [close] has been called on this client.
+  bool get isClosed => _closed;
+
+  void _ensureOpen() {
+    if (_closed) {
+      throw StateError('KV store is closed');
+    }
+  }
 
   /// Spawns the router and write worker pool. Returns a client bound to that router.
   static Future<MultiIsolateKvStoreClient> spawn({
@@ -63,6 +47,13 @@ class MultiIsolateKvStoreClient {
     Duration flushInterval = const Duration(milliseconds: 100),
     int writeMaxInFlightChunks = 8,
   }) async {
+    if (rootDirPath.isEmpty) {
+      throw ArgumentError.value(
+        rootDirPath,
+        'rootDirPath',
+        'must not be empty',
+      );
+    }
     if (numWriteWorkers <= 0) {
       throw ArgumentError.value(
         numWriteWorkers,
@@ -75,6 +66,13 @@ class MultiIsolateKvStoreClient {
         folderHierarchyLevels,
         'folderHierarchyLevels',
         'must be 0, 1, or 2',
+      );
+    }
+    if (writeIdlePurgeDuration.isNegative) {
+      throw ArgumentError.value(
+        writeIdlePurgeDuration,
+        'writeIdlePurgeDuration',
+        'must not be negative',
       );
     }
     if (flushThresholdBytes <= 0) {
@@ -122,6 +120,23 @@ class MultiIsolateKvStoreClient {
     );
   }
 
+  /// Shuts down router, worker, and folder isolates. Idempotent.
+  ///
+  /// After close, write/delete/subscribe operations throw [StateError].
+  /// Direct reads via [readStream] remain available.
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+
+    final replyPort = ReceivePort();
+    _routerPort.send(<String, dynamic>{
+      'type': 'shutdown',
+      'replyPort': replyPort.sendPort,
+    });
+    await replyPort.first;
+    replyPort.close();
+  }
+
   /// Streaming write into the KV store for [key] with [extension].
   Future<void> writeFromStream(
     String key,
@@ -129,6 +144,8 @@ class MultiIsolateKvStoreClient {
     String extension = 'bin',
     bool truncateExisting = true,
   }) async {
+    _ensureOpen();
+
     final replyPort = ReceivePort();
     _routerPort.send(<String, dynamic>{
       'type': 'openWrite',
@@ -140,7 +157,7 @@ class MultiIsolateKvStoreClient {
 
     final ack = await replyPort.first as Map;
     replyPort.close();
-    _throwIfError(ack);
+    kvThrowIfError(ack);
 
     final writeId = ack['writeId'] as int;
     final workerPort = ack['workerPort'] as SendPort;
@@ -151,11 +168,16 @@ class MultiIsolateKvStoreClient {
     if (_writeMaxInFlightChunks > 0) {
       creditPort = ReceivePort();
       creditIterator = StreamIterator<dynamic>(creditPort);
+      final creditsReply = ReceivePort();
       workerPort.send(<String, dynamic>{
         'type': 'registerCredits',
         'writeId': writeId,
         'creditPort': creditPort.sendPort,
+        'replyPort': creditsReply.sendPort,
       });
+      final creditsAck = await creditsReply.first as Map;
+      creditsReply.close();
+      kvThrowIfError(creditsAck);
     }
 
     try {
@@ -171,9 +193,8 @@ class MultiIsolateKvStoreClient {
           credits--;
         }
 
-        final transferable = TransferableTypedData.fromList([
-          Uint8List.fromList(chunk),
-        ]);
+        final bytes = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+        final transferable = TransferableTypedData.fromList([bytes]);
         workerPort.send(<String, dynamic>{
           'type': 'writeChunk',
           'writeId': writeId,
@@ -201,13 +222,15 @@ class MultiIsolateKvStoreClient {
     });
     final endAck = await endReply.first as Map;
     endReply.close();
-    _throwIfError(endAck);
+    kvThrowIfError(endAck);
   }
 
   Stream<List<int>> subscribeLive(
     String key, {
     String extension = 'bin',
   }) {
+    _ensureOpen();
+
     final recv = ReceivePort();
     _routerPort.send(<String, dynamic>{
       'type': 'subscribeLive',
@@ -222,6 +245,8 @@ class MultiIsolateKvStoreClient {
       if (message == null) {
         recv.close();
         controller.close();
+      } else if (message is TransferableTypedData) {
+        controller.add(message.materialize().asUint8List());
       } else {
         controller.add((message as List).cast<int>());
       }
@@ -281,6 +306,8 @@ class MultiIsolateKvStoreClient {
   }
 
   Future<void> delete(String key, {String extension = 'bin'}) async {
+    _ensureOpen();
+
     final replyPort = ReceivePort();
     _routerPort.send(<String, dynamic>{
       'type': 'delete',
@@ -290,6 +317,6 @@ class MultiIsolateKvStoreClient {
     });
     final ack = await replyPort.first as Map;
     replyPort.close();
-    _throwIfError(ack);
+    kvThrowIfError(ack);
   }
 }

@@ -1,15 +1,14 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 
 import 'hashed_kv_path.dart';
-
+import 'kv_exceptions.dart';
 import 'kv_worker_isolate.dart';
 
 typedef _Cmd = Map<String, dynamic>;
 
-void _sendError(SendPort? port, Object error) {
-  port?.send(<String, dynamic>{'error': error.toString()});
-}
+String _chanId(String key, String ext) => '$key::$ext';
 
 /// Router isolate entry.
 void kvRouterIsolateEntry(List<dynamic> args) async {
@@ -32,6 +31,55 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
   }
 
   final writeWorkers = List<SendPort?>.filled(numWriteWorkers, null);
+  final workerWaiters =
+      List<List<Completer<void>>>.generate(numWriteWorkers, (_) => []);
+  final liveSubscriptions = <String, List<SendPort>>{};
+  final folderEnsuresInFlight = <String, Future<void>>{};
+
+  SendPort? folderPort;
+  var shuttingDown = false;
+
+  Future<SendPort> getWorkerPort(int idx) async {
+    final port = writeWorkers[idx];
+    if (port != null) return port;
+
+    final completer = Completer<void>();
+    workerWaiters[idx].add(completer);
+    await completer.future;
+    return writeWorkers[idx]!;
+  }
+
+  void reregisterSubscriptions(int workerIdx) {
+    final port = writeWorkers[workerIdx];
+    if (port == null) return;
+
+    for (final entry in liveSubscriptions.entries) {
+      final parts = entry.key.split('::');
+      if (parts.length != 2) continue;
+      final key = parts[0];
+      final ext = parts[1];
+      if (workerIndexForKey(key) != workerIdx) continue;
+
+      for (final subPort in entry.value) {
+        port.send(<String, dynamic>{
+          'type': 'subscribeLive',
+          'key': key,
+          'ext': ext,
+          'subscriberPort': subPort,
+        });
+      }
+    }
+  }
+
+  void notifyWorkerReady(int idx) {
+    for (final waiter in workerWaiters[idx]) {
+      if (!waiter.isCompleted) {
+        waiter.complete();
+      }
+    }
+    workerWaiters[idx].clear();
+    reregisterSubscriptions(idx);
+  }
 
   Future<void> spawnWorker(int index) async {
     final init = ReceivePort();
@@ -51,6 +99,7 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
       ],
     );
     writeWorkers[index] = await init.first as SendPort;
+    notifyWorkerReady(index);
 
     workerControlPort.listen((raw) async {
       if (raw is! _Cmd) return;
@@ -71,86 +120,149 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
     kvFolderIsolateEntry,
     [rootDirPath, folderInit.sendPort, folderHierarchyLevels],
   );
-  final folderPort = await folderInit.first as SendPort;
+  folderPort = await folderInit.first as SendPort;
+
+  Future<void> ensureFolderOnce(String folderPath) async {
+    final folderReply = ReceivePort();
+    folderPort!.send(<String, dynamic>{
+      'type': 'ensureFolder',
+      'folderPath': folderPath,
+      'replyPort': folderReply.sendPort,
+    });
+    final folderResult = await folderReply.first as Map;
+    folderReply.close();
+
+    if (folderResult.containsKey('error')) {
+      throw StateError(folderResult['error'] as String);
+    }
+  }
+
+  Future<void> ensureFolder(String folderPath) async {
+    final inFlight = folderEnsuresInFlight[folderPath];
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = ensureFolderOnce(folderPath);
+    folderEnsuresInFlight[folderPath] = future;
+    try {
+      await future;
+    } finally {
+      folderEnsuresInFlight.remove(folderPath);
+    }
+  }
+
+  Future<void> handleOpenWrite(_Cmd cmd) async {
+    final key = cmd['key'] as String;
+    final ext = cmd['ext'] as String;
+    final replyPort = cmd['replyPort'] as SendPort;
+    final workerIdx = workerIndexForKey(key);
+
+    try {
+      final workerPort = await getWorkerPort(workerIdx);
+      final paths = HashedKvPath.pathsForKey(
+        rootDirPath,
+        key,
+        ext,
+        folderHierarchyLevels,
+      );
+      await ensureFolder(paths.folderPath);
+
+      cmd['filePath'] = paths.filePath;
+      workerPort.send(cmd);
+    } catch (e, st) {
+      kvSendError(replyPort, e, st);
+    }
+  }
+
+  Future<void> handleSubscribeLive(_Cmd cmd) async {
+    final key = cmd['key'] as String;
+    final ext = cmd['ext'] as String;
+    final subPort = cmd['subscriberPort'] as SendPort;
+    final chanKey = _chanId(key, ext);
+
+    liveSubscriptions.putIfAbsent(chanKey, () => <SendPort>[]).add(subPort);
+
+    final workerIdx = workerIndexForKey(key);
+    final workerPort = await getWorkerPort(workerIdx);
+    workerPort.send(cmd);
+  }
+
+  Future<void> handleDelete(_Cmd cmd) async {
+    final key = cmd['key'] as String;
+    final ext = cmd['ext'] as String;
+    final workerIdx = workerIndexForKey(key);
+
+    cmd['filePath'] = HashedKvPath.pathForKey(
+      rootDirPath,
+      key,
+      ext,
+      folderHierarchyLevels,
+    );
+
+    final workerPort = await getWorkerPort(workerIdx);
+    workerPort.send(cmd);
+  }
+
+  Future<void> handleShutdown(SendPort replyPort) async {
+    if (shuttingDown) {
+      kvSendOk(replyPort);
+      return;
+    }
+    shuttingDown = true;
+
+    final acks = <Future<void>>[];
+
+    for (final port in writeWorkers) {
+      if (port == null) continue;
+      final reply = ReceivePort();
+      port.send(<String, dynamic>{
+        'type': 'shutdown',
+        'replyPort': reply.sendPort,
+      });
+      acks.add(reply.first.then((_) => reply.close()));
+    }
+
+    final folder = folderPort;
+    if (folder != null) {
+      final reply = ReceivePort();
+      folder.send(<String, dynamic>{
+        'type': 'shutdown',
+        'replyPort': reply.sendPort,
+      });
+      acks.add(reply.first.then((_) => reply.close()));
+    }
+
+    await Future.wait(acks);
+    kvSendOk(replyPort);
+    Isolate.exit();
+  }
 
   final routerPort = ReceivePort();
   initPort.send(routerPort.sendPort);
 
-  await for (final raw in routerPort) {
+  routerPort.listen((raw) {
     final cmd = raw as _Cmd;
     final type = cmd['type'] as String;
 
     switch (type) {
       case 'openWrite':
-        {
-          final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
-          final replyPort = cmd['replyPort'] as SendPort;
-          final workerIdx = workerIndexForKey(key);
-          final workerPort = writeWorkers[workerIdx];
-          if (workerPort == null) {
-            _sendError(replyPort, StateError('write worker unavailable'));
-            break;
-          }
-
-          final folderPath = HashedKvPath.folderPathForKey(
-            rootDirPath,
-            key,
-            folderHierarchyLevels,
-          );
-          final filePath = HashedKvPath.pathForKey(
-            rootDirPath,
-            key,
-            ext,
-            folderHierarchyLevels,
-          );
-
-          final folderReply = ReceivePort();
-          folderPort.send(<String, dynamic>{
-            'type': 'ensureFolder',
-            'folderPath': folderPath,
-            'replyPort': folderReply.sendPort,
-          });
-          final folderResult = await folderReply.first as Map;
-          folderReply.close();
-
-          if (folderResult.containsKey('error')) {
-            _sendError(replyPort, folderResult['error'] as Object);
-            break;
-          }
-
-          cmd['filePath'] = filePath;
-          workerPort.send(cmd);
-        }
+        unawaited(handleOpenWrite(cmd));
         break;
-
       case 'subscribeLive':
-        {
-          final key = cmd['key'] as String;
-          final workerIdx = workerIndexForKey(key);
-          writeWorkers[workerIdx]?.send(cmd);
-        }
+        unawaited(handleSubscribeLive(cmd));
         break;
-
       case 'delete':
-        {
-          final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
-          final workerIdx = workerIndexForKey(key);
-          cmd['filePath'] = HashedKvPath.pathForKey(
-            rootDirPath,
-            key,
-            ext,
-            folderHierarchyLevels,
-          );
-          writeWorkers[workerIdx]?.send(cmd);
-        }
+        unawaited(handleDelete(cmd));
         break;
-
+      case 'shutdown':
+        unawaited(handleShutdown(cmd['replyPort'] as SendPort));
+        break;
       default:
         break;
     }
-  }
+  });
 }
 
 /// Master folder isolate: handles all directory creation operations.
@@ -165,7 +277,15 @@ void kvFolderIsolateEntry(List<dynamic> args) async {
 
   await for (final raw in cmdPort) {
     final cmd = raw as _Cmd;
-    if (cmd['type'] != 'ensureFolder') continue;
+    final type = cmd['type'] as String;
+
+    if (type == 'shutdown') {
+      final replyPort = cmd['replyPort'] as SendPort?;
+      kvSendOk(replyPort);
+      Isolate.exit();
+    }
+
+    if (type != 'ensureFolder') continue;
 
     final replyPort = cmd['replyPort'] as SendPort;
 
@@ -183,9 +303,9 @@ void kvFolderIsolateEntry(List<dynamic> args) async {
         createdFolders.add(folderPath);
       }
 
-      replyPort.send(<String, dynamic>{'ok': true});
-    } catch (e) {
-      replyPort.send(<String, dynamic>{'error': e.toString()});
+      kvSendOk(replyPort);
+    } catch (e, st) {
+      kvSendError(replyPort, e, st);
     }
   }
 }

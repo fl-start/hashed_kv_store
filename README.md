@@ -189,7 +189,7 @@ Streaming write into the KV store.
 - Different keys may be written concurrently across different write workers
 - Folder creation is handled by master folder isolate (centralized)
 - `extension`: File extension without leading dot (e.g., 'eml', 'bin')
-- `truncateExisting`: If true, overwrites existing file; otherwise appends
+- `truncateExisting`: If true, overwrites existing file atomically via temp file + rename; otherwise appends directly to the target file. **Append mode is not atomic** — readers may observe partial content while an append is in progress.
 
 #### `readStream(String key, {String extension = 'bin'})`
 
@@ -211,6 +211,14 @@ Subscribe to live writes for a key.
 - Returns a `Stream<List<int>>` that emits chunks as they are written to disk
 - Stream completes when the writer finishes
 - No polling - pure push-based notifications
+- Subscriptions are re-registered automatically when a write worker respawns after idle purge
+
+#### `close()`
+
+Shuts down router, worker, and folder isolates. Idempotent.
+
+- After close, `writeFromStream`, `delete`, and `subscribeLive` throw `StateError`
+- Direct reads via `readStream` remain available
 
 #### `delete(String key, {String extension = 'bin'})`
 
