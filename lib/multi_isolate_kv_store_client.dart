@@ -1,11 +1,8 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
-import 'package:crypto/crypto.dart';
-import 'package:path/path.dart' as p;
-
+import 'hashed_kv_path.dart';
 import 'kv_router_isolate.dart';
 
 /// Thrown when a value for a given key does not exist on disk.
@@ -24,10 +21,11 @@ class KvNotFoundException implements Exception {
 ///
 /// Behind the scenes:
 /// - Spawns one router isolate.
-/// - Router spawns a pool of read worker isolates.
-/// - A single dedicated writer isolate is lazily created on first write.
-/// - All disk writes are globally serialized in strict FIFO order.
-/// - Reads can be handled by any worker (filesystem is shared).
+/// - Router spawns a pool of write worker isolates, sharded by key.
+/// - A master folder isolate serializes all directory creation.
+/// - Writes for the same (key, extension) are serialized within a write worker.
+/// - Different keys may be written concurrently across different write workers.
+/// - Reads bypass isolates and read directly from the shared filesystem.
 class MultiIsolateKvStoreClient {
   final SendPort _routerPort;
   final int _folderHierarchyLevels;
@@ -162,15 +160,19 @@ class MultiIsolateKvStoreClient {
   ///
   /// [rootDirPath] must be the same directory used when spawning the store.
   String pathForKey(String rootDirPath, String key, {String extension = 'bin'}) {
-    return _buildPathForKey(rootDirPath, key, extension, _folderHierarchyLevels);
+    return HashedKvPath.pathForKey(
+      rootDirPath,
+      key,
+      extension,
+      _folderHierarchyLevels,
+    );
   }
 
   /// Streaming read for the value stored under [key]/[extension].
   ///
   /// Reads directly from disk without going through worker isolates.
   /// The returned stream emits file chunks and then completes.
-  /// If the key does not exist, the stream will emit a [StateError]
-  /// with message 'not_found' and then close.
+  /// Throws [KvNotFoundException] if the key does not exist.
   ///
   /// [rootDirPath] must be the same directory used when spawning the store.
   Stream<List<int>> readStream(
@@ -182,7 +184,7 @@ class MultiIsolateKvStoreClient {
     final file = File(filePath);
 
     if (!await file.exists()) {
-      throw StateError('not_found');
+      throw KvNotFoundException(key, extension);
     }
 
     final stream = file.openRead();
@@ -193,67 +195,16 @@ class MultiIsolateKvStoreClient {
 
   /// Delete the value for [key]/[extension] if it exists.
   ///
-  /// This is a fire-and-forget command; you can extend it
-  /// to return a result if needed.
+  /// Waits until the write worker has processed the delete command.
   Future<void> delete(String key, {String extension = 'bin'}) async {
+    final replyPort = ReceivePort();
     _routerPort.send(<String, dynamic>{
       'type': 'delete',
       'key': key,
       'ext': extension,
+      'replyPort': replyPort.sendPort,
     });
+    await replyPort.first;
+    replyPort.close();
   }
 }
-
-/// Compute Crockford Base32 encoding for a key (private helper).
-String _computeBase32ForKey(String key) {
-  const String crockfordBase32Lower = '0123456789abcdefghjkmnpqrstvwxyz';
-  final digestBytes = sha256.convert(utf8.encode(key)).bytes;
-  final out = StringBuffer();
-
-  var bitBuffer = 0;
-  var bitCount = 0;
-  for (final byte in digestBytes) {
-    bitBuffer = (bitBuffer << 8) | byte;
-    bitCount += 8;
-    while (bitCount >= 5) {
-      final index = (bitBuffer >> (bitCount - 5)) & 0x1f;
-      out.write(crockfordBase32Lower[index]);
-      bitCount -= 5;
-    }
-  }
-
-  if (bitCount > 0) {
-    final index = (bitBuffer << (5 - bitCount)) & 0x1f;
-    out.write(crockfordBase32Lower[index]);
-  }
-
-  return out.toString();
-}
-
-/// Build a file path based on hierarchy level.
-/// 
-/// [hierarchyLevels]: 0, 1, or 2
-///   0: <rootDir>/<cccc-cccc-cccc-cccc>.<ext>
-///   1: <rootDir>/<cc>/<cccc-cccc-cccc-cccc>.<ext>
-///   2: <rootDir>/<cc>/<cc>/<cccc-cccc-cccc-cccc>.<ext>
-String _buildPathForKey(String rootDirPath, String key, String extension, int hierarchyLevels) {
-  final digestBase32 = _computeBase32ForKey(key);
-  final stem = digestBase32.substring(4, 20);
-  final fileStem =
-      '${stem.substring(0, 4)}-${stem.substring(4, 8)}-${stem.substring(8, 12)}-${stem.substring(12, 16)}';
-  final fileName =
-      extension.isEmpty ? fileStem : '$fileStem.$extension'.replaceAll('..', '.');
-
-  if (hierarchyLevels == 0) {
-    return p.join(rootDirPath, fileName);
-  } else if (hierarchyLevels == 1) {
-    final level1 = digestBase32.substring(0, 2);
-    return p.join(rootDirPath, level1, fileName);
-  } else {
-    // hierarchyLevels == 2
-    final level1 = digestBase32.substring(0, 2);
-    final level2 = digestBase32.substring(2, 4);
-    return p.join(rootDirPath, level1, level2, fileName);
-  }
-}
-

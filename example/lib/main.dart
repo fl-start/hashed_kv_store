@@ -100,7 +100,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
 
       _store = await MultiIsolateKvStoreClient.spawn(
         rootDirPath: storageDir.path,
-        numWorkers: 4,
+        numWriteWorkers: 4,
       );
 
       setState(() {
@@ -214,7 +214,11 @@ class _DownloadScreenState extends State<DownloadScreen> {
         _downloadStatus = 'Reading file...';
       });
 
-      final readStream = _store!.readStream(key, extension: extension);
+      final readStream = _store!.readStream(
+        _storagePath!,
+        key,
+        extension: extension,
+      );
       final bytes = <int>[];
       await for (final chunk in readStream) {
         bytes.addAll(chunk);

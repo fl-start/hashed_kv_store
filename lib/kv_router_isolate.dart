@@ -1,25 +1,11 @@
-import 'dart:isolate';
 import 'dart:io';
-import 'dart:convert';
+import 'dart:isolate';
 
-import 'package:crypto/crypto.dart';
-import 'package:path/path.dart' as p;
+import 'hashed_kv_path.dart';
 
 import 'kv_worker_isolate.dart';
 
 typedef _Cmd = Map<String, dynamic>;
-
-class _LiveSubscription {
-  final String key;
-  final String ext;
-  final SendPort subscriberPort;
-
-  _LiveSubscription({
-    required this.key,
-    required this.ext,
-    required this.subscriberPort,
-  });
-}
 
 /// Router isolate entry.
 ///
@@ -62,9 +48,6 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
   );
   final folderPort = await folderInit.first as SendPort;
 
-  // Track live subscriptions for replay on write worker restarts
-  final liveSubscriptions = <_LiveSubscription>[];
-
   final routerPort = ReceivePort();
   initPort.send(routerPort.sendPort);
 
@@ -79,7 +62,6 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
       case 'openWrite':
         {
           final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
           final workerIdx = workerIndexForKey(key);
 
           // Ask folder isolate to ensure directories exist
@@ -119,18 +101,7 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
       case 'subscribeLive':
         {
           final key = cmd['key'] as String;
-          final ext = cmd['ext'] as String;
-          final subscriberPort = cmd['subscriberPort'] as SendPort;
           final workerIdx = workerIndexForKey(key);
-
-          liveSubscriptions.add(
-            _LiveSubscription(
-              key: key,
-              ext: ext,
-              subscriberPort: subscriberPort,
-            ),
-          );
-
           writeWorkers[workerIdx].send(cmd);
         }
         break;
@@ -162,7 +133,6 @@ void kvFolderIsolateEntry(List<dynamic> args) async {
   final String rootDirPath = args[0] as String;
   final SendPort initPort = args[1] as SendPort;
   final int folderHierarchyLevels = (args.length > 2 ? args[2] as int : 1);
-  final rootDir = Directory(rootDirPath);
   final createdFolders = <String>{};
 
   final cmdPort = ReceivePort();
@@ -176,21 +146,11 @@ void kvFolderIsolateEntry(List<dynamic> args) async {
       final key = cmd['key'] as String;
       final replyPort = cmd['replyPort'] as SendPort;
 
-      // Compute folder path from key
-      final digestBase32 = _computeBase32ForKey(key);
-      String folderPath;
-
-      if (folderHierarchyLevels == 0) {
-        folderPath = rootDir.path;
-      } else if (folderHierarchyLevels == 1) {
-        final level1 = digestBase32.substring(0, 2);
-        folderPath = p.join(rootDir.path, level1);
-      } else {
-        // folderHierarchyLevels == 2
-        final level1 = digestBase32.substring(0, 2);
-        final level2 = digestBase32.substring(2, 4);
-        folderPath = p.join(rootDir.path, level1, level2);
-      }
+      final folderPath = HashedKvPath.folderPathForKey(
+        rootDirPath,
+        key,
+        folderHierarchyLevels,
+      );
 
       // Only create if not already created in this isolate session
       if (!createdFolders.contains(folderPath)) {
@@ -201,29 +161,4 @@ void kvFolderIsolateEntry(List<dynamic> args) async {
       replyPort.send({'ok': true});
     }
   }
-}
-
-String _computeBase32ForKey(String key) {
-  const String crockfordBase32Lower = '0123456789abcdefghjkmnpqrstvwxyz';
-  final digestBytes = sha256.convert(utf8.encode(key)).bytes;
-  final out = StringBuffer();
-
-  var bitBuffer = 0;
-  var bitCount = 0;
-  for (final byte in digestBytes) {
-    bitBuffer = (bitBuffer << 8) | byte;
-    bitCount += 8;
-    while (bitCount >= 5) {
-      final index = (bitBuffer >> (bitCount - 5)) & 0x1f;
-      out.write(crockfordBase32Lower[index]);
-      bitCount -= 5;
-    }
-  }
-
-  if (bitCount > 0) {
-    final index = (bitBuffer << (5 - bitCount)) & 0x1f;
-    out.write(crockfordBase32Lower[index]);
-  }
-
-  return out.toString();
 }

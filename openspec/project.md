@@ -15,7 +15,8 @@ A SHA256-based key/value store package for Dart with streaming IO and multi-isol
 
 ### Code Style
 - Follows Dart style guide and uses `flutter_lints` package for linting rules
-- Private classes and members prefixed with underscore (e.g., `_HashedKvCore`, `_WriteContext`)
+- Private classes and members prefixed with underscore (e.g., `_WriteContext`)
+- Shared path logic lives in `HashedKvPath` (`lib/hashed_kv_path.dart`)
 - Use `typedef` for command types (e.g., `typedef _Cmd = Map<String, dynamic>`)
 - Prefer descriptive names that clearly indicate purpose
 - Use documentation comments (`///`) for public APIs

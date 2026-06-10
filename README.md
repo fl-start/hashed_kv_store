@@ -33,9 +33,10 @@ import 'dart:convert';
 import 'package:hashed_kv_store/hashed_kv_store.dart';
 
 void main() async {
+  const rootDirPath = './kv_root';
   final store = await MultiIsolateKvStoreClient.spawn(
-    rootDirPath: './kv_root',
-    numWorkers: 4,
+    rootDirPath: rootDirPath,
+    numWriteWorkers: 4,
   );
 
   const key = 'user:1234:profile';
@@ -49,7 +50,7 @@ void main() async {
   await store.writeFromStream(key, writeStream, extension: ext);
 
   // Read
-  final readStream = store.readStream(key, extension: ext);
+  final readStream = store.readStream(rootDirPath, key, extension: ext);
   final bytes = <int>[];
   await for (final chunk in readStream) {
     bytes.addAll(chunk);
@@ -64,7 +65,7 @@ void main() async {
 ```dart
 final store = await MultiIsolateKvStoreClient.spawn(
   rootDirPath: './kv_root',
-  numWorkers: 4,
+  numWriteWorkers: 4,
 );
 
 const key = 'live:log:stream';
@@ -102,7 +103,7 @@ Future<void> downloadToKvStore() async {
   final dio = Dio();
   final store = await MultiIsolateKvStoreClient.spawn(
     rootDirPath: './kv_root',
-    numWorkers: 4,
+    numWriteWorkers: 4,
   );
 
   const url = 'https://example.com/large-file.eml';
@@ -176,7 +177,7 @@ Streaming read for the value stored under [key]/[extension].
 
 - Reads directly from disk without going through isolates
 - Returns a `Stream<List<int>>` that emits file chunks
-- Throws `StateError` with message 'not_found' if key doesn't exist
+- Throws [KvNotFoundException] if key doesn't exist
 - Can be called from any isolate (main UI, compute isolates, etc.)
 - `rootDirPath` must be the same directory used when spawning the store
 
@@ -198,7 +199,7 @@ Subscribe to live writes for a key.
 
 #### `delete(String key, {String extension = 'bin'})`
 
-Delete the value for a key if it exists.
+Delete the value for a key if it exists. Returns a [Future] that completes when the write worker has processed the delete.
 
 ## Architecture
 

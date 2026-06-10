@@ -62,7 +62,7 @@ void main() {
     final readStream = store.readStream(tempDir.path, key, extension: ext);
     expect(
       () async => await readStream.forEach((_) {}),
-      throwsA(isA<StateError>()),
+      throwsA(isA<KvNotFoundException>()),
     );
   });
 
@@ -185,14 +185,11 @@ void main() {
     // Delete
     await store.delete(key, extension: ext);
 
-    // Wait for delete to complete
-    await Future.delayed(const Duration(milliseconds: 100));
-
     // Read should fail
     final readStream = store.readStream(tempDir.path, key, extension: ext);
     expect(
       () async => await readStream.forEach((_) {}),
-      throwsA(isA<StateError>()),
+      throwsA(isA<KvNotFoundException>()),
     );
   });
 
@@ -265,9 +262,9 @@ void main() {
     expect(relative, isNot(matches(RegExp(r'[ilo]'))));
   });
 
-  test('writes are globally queued in strict FIFO order', () async {
-    const key1 = 'fifo:key:1';
-    const key2 = 'fifo:key:2';
+  test('different keys can be written concurrently across workers', () async {
+    const key1 = 'concurrent:key:alpha';
+    const key2 = 'concurrent:key:beta';
     const ext = 'txt';
 
     final firstController = StreamController<List<int>>();
@@ -286,26 +283,28 @@ void main() {
       secondWriteCompleted = true;
     });
 
-    firstController.add(utf8.encode('first-start\n'));
-    await Future.delayed(const Duration(milliseconds: 120));
+    secondController.add(utf8.encode('second\n'));
+    await secondController.close();
+    await secondWrite;
 
-    // Second write must still be blocked by the first, even for a different key.
-    expect(secondWriteCompleted, isFalse);
+    // Different keys may complete independently while another write is active.
+    expect(secondWriteCompleted, isTrue);
 
-    final secondClose = secondController.close();
-    firstController.add(utf8.encode('first-end\n'));
+    firstController.add(utf8.encode('first\n'));
     await firstController.close();
-
-    await expectLater(firstWrite, completes);
-    await secondClose;
-    await expectLater(secondWrite, completes);
+    await firstWrite;
 
     final key1Bytes = <int>[];
     await for (final chunk in store.readStream(tempDir.path, key1, extension: ext)) {
       key1Bytes.addAll(chunk);
     }
-    expect(utf8.decode(key1Bytes), contains('first-start'));
-    expect(utf8.decode(key1Bytes), contains('first-end'));
+    expect(utf8.decode(key1Bytes), contains('first'));
+
+    final key2Bytes = <int>[];
+    await for (final chunk in store.readStream(tempDir.path, key2, extension: ext)) {
+      key2Bytes.addAll(chunk);
+    }
+    expect(utf8.decode(key2Bytes), contains('second'));
   });
 
   test('folder hierarchy level 0 stores files in root', () async {
