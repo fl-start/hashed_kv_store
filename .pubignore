@@ -1,0 +1,7 @@
+# Dev / tooling (not needed on pub.dev)
+openspec/
+.cursor/
+.claude/
+AGENTS.md
+CLAUDE.md
+.github/

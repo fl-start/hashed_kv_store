@@ -1,16 +1,17 @@
-# example
+# Hashed KV Store Demo
 
-A new Flutter project.
+Flutter example that downloads files over HTTP (via Dio) and streams them into
+`hashed_kv_store`, with live write progress via `subscribeLive`.
 
-## Getting Started
+## Run
 
-This project is a starting point for a Flutter application.
+```bash
+cd example
+flutter pub get
+flutter run
+```
 
-A few resources to get you started if this is your first Flutter project:
+## Configuration
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+- `kFolderHierarchyLevels` in `lib/main.dart` — `1` (default) or `2` for nested folders
+- Downloads are stored under the app documents directory in `hashed_kv_store/`

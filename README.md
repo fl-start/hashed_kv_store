@@ -1,5 +1,7 @@
 # hashed_kv_store
 
+[![CI](https://github.com/fl-start/hashed_kv_store/actions/workflows/ci.yml/badge.svg)](https://github.com/fl-start/hashed_kv_store/actions/workflows/ci.yml)
+
 A SHA256-based key/value store with streaming IO and multi-isolate support for Dart.
 
 ## Features
