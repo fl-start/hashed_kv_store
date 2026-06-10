@@ -14,6 +14,8 @@ A SHA256-based key/value store with streaming IO and multi-isolate support for D
   - Reads can be performed directly from any isolate (including main UI) without going through the router
 - **Live subscriptions**: Subscribe to writes as they happen (similar to `tail -f`)
 - **No polling**: Push-based notifications to subscribers
+- **Atomic truncate writes**: Overwrites use temp file + rename so readers keep seeing prior content until the write completes
+- **Durability options**: Optional `fsyncOnClose`, configurable flush interval/threshold, and write backpressure
 
 ## Getting started
 
@@ -228,8 +230,11 @@ The package uses a multi-isolate architecture:
 3. **Write worker isolates**: Handle file I/O with per-key serialization
   - Sharded by key hash for parallelism across keys
   - Per-key write queue: writes to same (key, ext) are serialized
+  - Truncate writes go to a temp file and are renamed atomically on completion
+  - After `openWrite`, chunks flow directly from client to worker (`TransferableTypedData`)
   - Notifies live subscribers as data is written
-  - May self-purge after configured idle timeout
+  - Idle workers exit and are respawned by the router
+  - Deletes are queued behind active/pending writes for the same key
 
 4. **Direct reads**: Reads can be performed from any isolate
   - Main UI isolate can read directly without blocking
@@ -258,3 +263,8 @@ The package uses a multi-isolate architecture:
 - Reads are fully decoupled from the router and can be done from any isolate
 - Direct read access allows zero-copy patterns for compute-intensive workloads
 - Live subscriptions work across isolates without polling
+- Missing keys throw `KvNotFoundException`; write failures throw `KvWriteException`
+
+## License
+
+MIT — see [LICENSE](LICENSE).
