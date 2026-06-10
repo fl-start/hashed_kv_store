@@ -109,7 +109,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     );
   }
 
-  Future<void> deleteKey(String key, String extension, {String? filePath}) async {
+  Future<void> deleteKey(String key, String extension,
+      {String? filePath}) async {
     final file = fileFor(key, extension, filePath: filePath);
     if (await file.exists()) {
       await file.delete();
@@ -215,16 +216,40 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     );
   }
 
+  Future<void> publishTempFile(File tempFile, File targetFile) async {
+    FileSystemException? lastError;
+
+    for (var attempt = 0; attempt < 100; attempt++) {
+      try {
+        await tempFile.rename(targetFile.path);
+        return;
+      } on FileSystemException catch (e) {
+        lastError = e;
+      }
+
+      try {
+        if (await targetFile.exists()) {
+          await targetFile.delete();
+        }
+        await tempFile.rename(targetFile.path);
+        return;
+      } on FileSystemException catch (e) {
+        lastError = e;
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
+    }
+
+    throw lastError ??
+        FileSystemException('Failed to publish temp file', tempFile.path);
+  }
+
   Future<void> completeWriteContext(_WriteContext ctx) async {
     await ctx.sink.flush();
     await ctx.sink.close();
 
     if (ctx.tempFile != null) {
       await syncFile(ctx.tempFile!);
-      if (await ctx.targetFile.exists()) {
-        await ctx.targetFile.delete();
-      }
-      await ctx.tempFile!.rename(ctx.targetFile.path);
+      await publishTempFile(ctx.tempFile!, ctx.targetFile);
       await syncFile(ctx.targetFile);
     } else {
       await syncFile(ctx.targetFile);
@@ -292,9 +317,10 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     if (!isActive && !anyActivityRecent) {
       cancelIdleTimer();
       idleTimer = Timer(Duration(milliseconds: idlePurgeMs), () {
-        final stillActive = activeWriteIdForKey.values.any((id) => id != null) ||
-            pendingWritesForKey.values.any((queue) => queue.isNotEmpty) ||
-            pendingDeletesForKey.values.any((queue) => queue.isNotEmpty);
+        final stillActive =
+            activeWriteIdForKey.values.any((id) => id != null) ||
+                pendingWritesForKey.values.any((queue) => queue.isNotEmpty) ||
+                pendingDeletesForKey.values.any((queue) => queue.isNotEmpty);
         if (!stillActive) {
           routerControlPort?.send(<String, dynamic>{
             'type': 'workerExiting',
@@ -325,8 +351,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           final k = chanId(key, ext);
           final active = activeWriteIdForKey[k];
 
-          if (active != null ||
-              (pendingWritesForKey[k]?.isNotEmpty ?? false)) {
+          if (active != null || (pendingWritesForKey[k]?.isNotEmpty ?? false)) {
             pendingWritesForKey
                 .putIfAbsent(k, () => <_QueuedWrite>[])
                 .add(_QueuedWrite(

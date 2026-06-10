@@ -80,7 +80,8 @@ void main() {
         );
         final path = store.pathForKey('k', extension: 'bin');
         final relative = p.relative(path, from: temp.path);
-        expect(relative.split(RegExp(r'[/\\]')).length, greaterThanOrEqualTo(3));
+        expect(
+            relative.split(RegExp(r'[/\\]')).length, greaterThanOrEqualTo(3));
       } finally {
         await temp.delete(recursive: true);
       }

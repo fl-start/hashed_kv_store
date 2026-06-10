@@ -121,8 +121,8 @@ void main() {
     final controller1 = StreamController<List<int>>();
     unawaited(
       store.writeFromStream(key, controller1.stream, extension: ext).then(
-        (_) => write1Complete.complete(),
-      ),
+            (_) => write1Complete.complete(),
+          ),
     );
 
     // Wait a bit for first write to start
@@ -132,8 +132,8 @@ void main() {
     final controller2 = StreamController<List<int>>();
     unawaited(
       store.writeFromStream(key, controller2.stream, extension: ext).then(
-        (_) => write2Complete.complete(),
-      ),
+            (_) => write2Complete.complete(),
+          ),
     );
 
     // Send data to first write
@@ -257,7 +257,8 @@ void main() {
           r'^[0-9a-z]{2}[/\\][0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}\.dat$',
         ),
       ),
-      reason: 'Path should use default 1-level folder hierarchy with Crockford Base32',
+      reason:
+          'Path should use default 1-level folder hierarchy with Crockford Base32',
     );
     expect(relative, isNot(matches(RegExp(r'[ilo]'))));
   });
@@ -401,7 +402,8 @@ void main() {
 
   test('folder hierarchy level 0 stores files in root', () async {
     // Test with 0 folder levels
-    final tempDir0 = await Directory.systemTemp.createTemp('hashed_kv_test_h0_');
+    final tempDir0 =
+        await Directory.systemTemp.createTemp('hashed_kv_test_h0_');
     try {
       final store0 = await MultiIsolateKvStoreClient.spawn(
         rootDirPath: tempDir0.path,
@@ -442,7 +444,8 @@ void main() {
 
   test('folder hierarchy level 1 stores files in one folder', () async {
     // Test with 1 folder level
-    final tempDir1 = await Directory.systemTemp.createTemp('hashed_kv_test_h1_');
+    final tempDir1 =
+        await Directory.systemTemp.createTemp('hashed_kv_test_h1_');
     try {
       final store1 = await MultiIsolateKvStoreClient.spawn(
         rootDirPath: tempDir1.path,
@@ -483,7 +486,8 @@ void main() {
 
   test('folder hierarchy level 2 stores files in two folders', () async {
     // Test with 2 folder levels (opt-in; default is 1)
-    final tempDir2 = await Directory.systemTemp.createTemp('hashed_kv_test_h2_');
+    final tempDir2 =
+        await Directory.systemTemp.createTemp('hashed_kv_test_h2_');
     try {
       final store2 = await MultiIsolateKvStoreClient.spawn(
         rootDirPath: tempDir2.path,
@@ -509,10 +513,10 @@ void main() {
       );
 
       // Check nested folders
-      final nestedDirs =
-          await tempDir2.list(recursive: true).toList();
+      final nestedDirs = await tempDir2.list(recursive: true).toList();
       final dirCount = nestedDirs.whereType<Directory>().length;
-      expect(dirCount, greaterThanOrEqualTo(2), reason: 'Should have at least 2 folder levels');
+      expect(dirCount, greaterThanOrEqualTo(2),
+          reason: 'Should have at least 2 folder levels');
 
       // Read back to verify content
       final readData = <int>[];
@@ -544,7 +548,8 @@ void main() {
     );
 
     final bytes = <int>[];
-    await for (final chunk in store.readStreamAt(tempDir.path, key, extension: ext)) {
+    await for (final chunk
+        in store.readStreamAt(tempDir.path, key, extension: ext)) {
       bytes.addAll(chunk);
     }
     expect(utf8.decode(bytes), equals('explicit'));
@@ -561,7 +566,8 @@ void main() {
     );
 
     final controller = StreamController<List<int>>();
-    final writeFuture = store.writeFromStream(key, controller.stream, extension: ext);
+    final writeFuture =
+        store.writeFromStream(key, controller.stream, extension: ext);
     controller.add(utf8.encode('partial'));
 
     final expectation = expectLater(writeFuture, throwsA(isA<StateError>()));
@@ -618,7 +624,8 @@ void main() {
       );
 
       final bytes = <int>[];
-      await for (final chunk in purgeStore.readStream('after:purge', extension: 'txt')) {
+      await for (final chunk
+          in purgeStore.readStream('after:purge', extension: 'txt')) {
         bytes.addAll(chunk);
       }
       expect(utf8.decode(bytes), equals('ok'));
@@ -627,5 +634,106 @@ void main() {
         await purgeDir.delete(recursive: true);
       }
     }
+  });
+
+  test('backpressure handles more chunks than the in-flight window', () async {
+    final smallWindowStore = await MultiIsolateKvStoreClient.spawn(
+      rootDirPath: tempDir.path,
+      numWriteWorkers: 1,
+      writeMaxInFlightChunks: 1,
+    );
+
+    const key = 'backpressure:many:chunks';
+    const ext = 'txt';
+    final chunks = List.generate(32, (i) => utf8.encode('$i\n'));
+
+    await smallWindowStore.writeFromStream(
+      key,
+      Stream<List<int>>.fromIterable(chunks),
+      extension: ext,
+    );
+
+    final bytes = <int>[];
+    await for (final chunk
+        in smallWindowStore.readStream(key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals(List.generate(32, (i) => '$i\n').join()));
+  });
+
+  test('truncate commit never exposes missing or partial content', () async {
+    const key = 'atomic:stress';
+    const ext = 'txt';
+    const oldContent = 'old-value';
+    const newContent = 'new-value';
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode(oldContent)),
+      extension: ext,
+    );
+
+    final controller = StreamController<List<int>>();
+    final writeFuture = store.writeFromStream(
+      key,
+      controller.stream,
+      extension: ext,
+    );
+
+    controller.add(utf8.encode(newContent));
+    final closeFuture = controller.close();
+
+    var sawNew = false;
+    for (var i = 0; i < 50 && !sawNew; i++) {
+      final bytes = <int>[];
+      await for (final chunk in store.readStream(key, extension: ext)) {
+        bytes.addAll(chunk);
+      }
+      final content = utf8.decode(bytes);
+      expect(content, anyOf(oldContent, newContent));
+      sawNew = content == newContent;
+      await Future.delayed(const Duration(milliseconds: 5));
+    }
+
+    await closeFuture;
+    await writeFuture;
+  });
+
+  test('spawn validates public parameters', () async {
+    await expectLater(
+      () => MultiIsolateKvStoreClient.spawn(
+        rootDirPath: tempDir.path,
+        numWriteWorkers: 0,
+      ),
+      throwsArgumentError,
+    );
+    await expectLater(
+      () => MultiIsolateKvStoreClient.spawn(
+        rootDirPath: tempDir.path,
+        folderHierarchyLevels: 3,
+      ),
+      throwsArgumentError,
+    );
+    await expectLater(
+      () => MultiIsolateKvStoreClient.spawn(
+        rootDirPath: tempDir.path,
+        flushThresholdBytes: 0,
+      ),
+      throwsArgumentError,
+    );
+    await expectLater(
+      () => MultiIsolateKvStoreClient.spawn(
+        rootDirPath: tempDir.path,
+        flushInterval: const Duration(milliseconds: -1),
+      ),
+      throwsArgumentError,
+    );
+    await expectLater(
+      () => MultiIsolateKvStoreClient.spawn(
+        rootDirPath: tempDir.path,
+        writeMaxInFlightChunks: -1,
+      ),
+      throwsArgumentError,
+    );
   });
 }

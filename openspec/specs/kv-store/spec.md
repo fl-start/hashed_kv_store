@@ -129,14 +129,14 @@ The system SHALL delete a key's file if present and complete the caller's `delet
 - **WHEN** a delete is requested while a write is active for the same key
 - **THEN** the delete runs after the active write completes
 
-### Requirement: Optional Fsync On Close
+### Requirement: Optional Best-Effort Fsync On Close
 
-The system SHALL support an optional `fsyncOnClose` spawn parameter (default false) that fsyncs file data before acknowledging completed writes.
+The system SHALL support an optional `fsyncOnClose` spawn parameter (default false) that performs a best-effort file flush before acknowledging completed writes.
 
 #### Scenario: Fsync disabled by default
 
 - **WHEN** a write completes with default spawn settings
-- **THEN** the write is acknowledged after flush and close without fsync
+- **THEN** the write is acknowledged after sink flush and close without an additional file flush
 
 ### Requirement: Write Backpressure
 

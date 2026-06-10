@@ -63,6 +63,42 @@ class MultiIsolateKvStoreClient {
     Duration flushInterval = const Duration(milliseconds: 100),
     int writeMaxInFlightChunks = 8,
   }) async {
+    if (numWriteWorkers <= 0) {
+      throw ArgumentError.value(
+        numWriteWorkers,
+        'numWriteWorkers',
+        'must be greater than zero',
+      );
+    }
+    if (folderHierarchyLevels < 0 || folderHierarchyLevels > 2) {
+      throw ArgumentError.value(
+        folderHierarchyLevels,
+        'folderHierarchyLevels',
+        'must be 0, 1, or 2',
+      );
+    }
+    if (flushThresholdBytes <= 0) {
+      throw ArgumentError.value(
+        flushThresholdBytes,
+        'flushThresholdBytes',
+        'must be greater than zero',
+      );
+    }
+    if (flushInterval.isNegative) {
+      throw ArgumentError.value(
+        flushInterval,
+        'flushInterval',
+        'must not be negative',
+      );
+    }
+    if (writeMaxInFlightChunks < 0) {
+      throw ArgumentError.value(
+        writeMaxInFlightChunks,
+        'writeMaxInFlightChunks',
+        'must not be negative',
+      );
+    }
+
     final init = ReceivePort();
     await Isolate.spawn(
       kvRouterIsolateEntry,
@@ -110,9 +146,11 @@ class MultiIsolateKvStoreClient {
     final workerPort = ack['workerPort'] as SendPort;
 
     ReceivePort? creditPort;
+    StreamIterator<dynamic>? creditIterator;
     var credits = _writeMaxInFlightChunks;
     if (_writeMaxInFlightChunks > 0) {
       creditPort = ReceivePort();
+      creditIterator = StreamIterator<dynamic>(creditPort);
       workerPort.send(<String, dynamic>{
         'type': 'registerCredits',
         'writeId': writeId,
@@ -124,7 +162,10 @@ class MultiIsolateKvStoreClient {
       await for (final chunk in data) {
         if (creditPort != null) {
           while (credits <= 0) {
-            await creditPort.first;
+            final hasCredit = await creditIterator!.moveNext();
+            if (!hasCredit) {
+              throw StateError('write credit port closed');
+            }
             credits++;
           }
           credits--;
@@ -144,10 +185,12 @@ class MultiIsolateKvStoreClient {
         'type': 'writeAbort',
         'writeId': writeId,
       });
+      await creditIterator?.cancel();
       creditPort?.close();
       rethrow;
     }
 
+    await creditIterator?.cancel();
     creditPort?.close();
 
     final endReply = ReceivePort();

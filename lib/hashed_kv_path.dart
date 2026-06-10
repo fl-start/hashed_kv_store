@@ -5,8 +5,7 @@ import 'package:path/path.dart' as p;
 
 /// Shared SHA256 → Crockford Base32 path mapping for the hashed KV store.
 class HashedKvPath {
-  static const String crockfordBase32Lower =
-      '0123456789abcdefghjkmnpqrstvwxyz';
+  static const String crockfordBase32Lower = '0123456789abcdefghjkmnpqrstvwxyz';
 
   /// Crockford Base32 encoding of the SHA256 digest for [key].
   static String crockfordBase32ForKey(String key) {

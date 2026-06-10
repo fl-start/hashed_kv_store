@@ -25,7 +25,7 @@ Add this package to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  hashed_kv_store: ^0.1.0
+  hashed_kv_store: ^0.2.0
 ```
 
 ## Usage
@@ -176,7 +176,7 @@ Spawns the router and write workers. Returns a client bound to that router.
 - `numWriteWorkers`: Number of write worker isolates to spawn, sharded by key (default: 2)
 - `folderHierarchyLevels`: Folder nesting depth - 0 (root only), 1 (one folder level), or 2 (two folder levels) (default: 1)
 - `writeIdlePurgeDuration`: Write worker idle timeout before purge (default: 60 seconds)
-- `fsyncOnClose`: When true, fsync file data before acknowledging writes (default: false)
+- `fsyncOnClose`: When true, performs a best-effort file flush before acknowledging writes (default: false)
 - `flushThresholdBytes`: Flush sink after chunks of this size (default: 65536)
 - `flushInterval`: Time-based flush interval for live subscribers (default: 100ms)
 - `writeMaxInFlightChunks`: Backpressure window for in-flight chunks; 0 disables (default: 8)
