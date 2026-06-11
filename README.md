@@ -25,7 +25,7 @@ Add this package to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  hashed_kv_store: ^0.3.1
+  hashed_kv_store: ^0.3.3
 ```
 
 ## Usage
@@ -188,7 +188,7 @@ On first spawn, the store writes `.hashed_kv_meta.json` under `rootDirPath` with
 
 #### `writeFromStream(String key, Stream<List<int>> data, {String extension = 'bin', bool truncateExisting = true})`
 
-Streaming write into the KV store.
+Streaming write into the KV store via worker isolates.
 
 - Writes for the same (key, extension) are serialized within a write worker
 - Different keys may be written concurrently across different write workers
@@ -198,13 +198,27 @@ Streaming write into the KV store.
 - If an active write fails due to a chunk or commit I/O error, queued writes and deletes for that same `(key, extension)` are failed as well. This avoids leaving the channel in an ambiguous partial state.
 - Truncate writes remove stale `.<writeId>.tmp` siblings for the target file before opening a new temp file.
 
-#### `readStream(String key, {String extension = 'bin'})`
+#### `openReadOnly({required String rootDirPath, ...})`
+
+Opens a read-only client without spawning write isolates. Use when the workload is read-heavy and writes are not needed (or use [writeFromStreamDirect] for bulk ingest in the caller isolate).
+
+#### `readBytes(String key, {String extension = 'bin', bool checkExists = true})`
+
+Reads the full value in the caller isolate via `File.readAsBytes()`. With `checkExists: true` (default), uses optimistic read (one syscall on hit). Preferred for small files.
+
+#### `readBytesAll(Iterable<String> keys, {String extension = 'bin', bool checkExists = true})`
+
+Reads many keys concurrently in the caller isolate.
+
+#### `readStream(String key, {String extension = 'bin', bool checkExists = true})`
 
 Streaming read for the value stored under [key]/[extension], using the client's `rootDirPath`.
 
-- Reads directly from disk without going through isolates
+- Reads directly from disk without going through isolates via `File.openRead()`
+- With `checkExists: true` (default), missing files are detected from the open error (one syscall on hit)
+- Set `checkExists: false` to surface raw `FileSystemException` when the file is missing
 - Returns a `Stream<List<int>>` that emits file chunks
-- Throws [KvNotFoundException] if key doesn't exist
+- Throws [KvNotFoundException] if key doesn't exist (when `checkExists` is true)
 - Use `readStreamAt(rootDirPath, key)` when reading from a different root
 
 #### `pathForKey(String key, {String extension = 'bin'})`
@@ -235,9 +249,30 @@ Shuts down router, worker, and folder isolates. Idempotent.
 - After close, `writeFromStream`, `delete`, and `subscribeLive` throw `StateError`
 - Direct reads via `readStream` remain available
 
+#### `writeFromStreamDirect(String key, Stream<List<int>> data, {String extension = 'bin', bool truncateExisting = true})`
+
+Caller-isolate write with the same atomic truncate semantics as worker writes. Does not notify live subscribers. Works on read-only clients.
+
 #### `delete(String key, {String extension = 'bin'})`
 
-Delete the value for a key if it exists. Returns a [Future] that completes when the write worker has processed the delete.
+Delete the value for a key if it exists. Returns a [Future] that completes when the write worker has processed the delete. Requires [spawn].
+
+#### `deleteLocal(String key, {String extension = 'bin'})`
+
+Delete directly in the caller isolate. Does not coordinate with in-flight worker writes for the same key.
+
+## Performance model
+
+Reads always run in the **caller isolate** — there is no read isolate hop. Per-read overhead is dominated by SHA256 path hashing and optional `exists()` checks, not disk streaming.
+
+| Workload | Recommended API |
+|----------|-----------------|
+| Many small reads | `readBytes()` or `readStream(checkExists: false)` |
+| Read-heavy, no writes | `openReadOnly()` — no worker isolates spawned |
+| Bulk ingest | `writeFromStreamDirect()` |
+| Live tail / concurrent writes | `spawn()` + `writeFromStream()` |
+
+Run benchmarks: `cd benchmark && dart pub get && dart run bin/many_small_reads_benchmark.dart`
 
 ## Architecture
 
@@ -280,6 +315,8 @@ The package uses a multi-isolate architecture:
   Remaining digest characters are ignored.
 
 ## Additional information
+
+- **Latency benchmarks** (isolate vs caller-isolate disk I/O): `cd benchmark && dart pub get && dart run bin/latency_benchmark.dart`
 
 - All operations are fully streaming - no buffering of entire files in memory
 - Writes for the same (key, extension) are serialized within their write worker

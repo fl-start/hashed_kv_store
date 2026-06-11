@@ -6,18 +6,21 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import 'hashed_kv_path.dart';
+import 'kv_direct_io.dart';
 import 'kv_exceptions.dart';
 import 'kv_layout_migration.dart';
+import 'kv_path_cache.dart';
 import 'kv_router_isolate.dart';
 
 export 'kv_exceptions.dart';
 
 /// Public client API for the multi-isolate KV store.
 class MultiIsolateKvStoreClient {
-  final SendPort _routerPort;
+  final SendPort? _routerPort;
   final String _rootDirPath;
   final int _folderHierarchyLevels;
   final int _writeMaxInFlightChunks;
+  final KvPathCache _pathCache;
   bool _closed = false;
 
   MultiIsolateKvStoreClient._(
@@ -25,18 +28,92 @@ class MultiIsolateKvStoreClient {
     this._rootDirPath,
     this._folderHierarchyLevels,
     this._writeMaxInFlightChunks,
+    this._pathCache,
   );
 
-  /// Root directory where KV files are stored (from [spawn]).
+  /// Root directory where KV files are stored.
   String get rootDirPath => _rootDirPath;
 
   /// Whether [close] has been called on this client.
   bool get isClosed => _closed;
 
+  /// Whether this client was opened with [openReadOnly] (no write isolates).
+  bool get isReadOnly => _routerPort == null;
+
   void _ensureOpen() {
     if (_closed) {
       throw StateError('KV store is closed');
     }
+  }
+
+  void _ensureWriteCapable() {
+    _ensureOpen();
+    if (_routerPort == null) {
+      throw StateError(
+        'Write operations require spawn(); use openReadOnly for read-only access',
+      );
+    }
+  }
+
+  String _cacheKey(String key, String extension) => '$key::$extension';
+
+  String _resolvePath(String rootDirPath, String key, String extension) {
+    if (rootDirPath != _rootDirPath) {
+      return HashedKvPath.pathForKey(
+        rootDirPath,
+        key,
+        extension,
+        _folderHierarchyLevels,
+      );
+    }
+    return _pathCache.getOrCompute(
+      _cacheKey(key, extension),
+      () => HashedKvPath.pathForKey(
+        _rootDirPath,
+        key,
+        extension,
+        _folderHierarchyLevels,
+      ),
+    );
+  }
+
+  File _fileFor(String rootDirPath, String key, String extension) {
+    return File(_resolvePath(rootDirPath, key, extension));
+  }
+
+  /// Opens a read-only client without spawning write isolates.
+  ///
+  /// Reads, [exists], [listStoredPaths], [deleteLocal], and
+  /// [writeFromStreamDirect] work in the caller isolate. Use [spawn] when
+  /// writes, [delete], or live subscriptions are needed.
+  static Future<MultiIsolateKvStoreClient> openReadOnly({
+    required String rootDirPath,
+    int folderHierarchyLevels = 1,
+    bool wipeOnLayoutMismatch = true,
+    int pathCacheMaxEntries = 4096,
+  }) async {
+    _validateRootDirPath(rootDirPath);
+    _validateFolderHierarchyLevels(folderHierarchyLevels);
+    if (pathCacheMaxEntries < 0) {
+      throw ArgumentError.value(
+        pathCacheMaxEntries,
+        'pathCacheMaxEntries',
+        'must not be negative',
+      );
+    }
+
+    await ensureKvStoreLayout(
+      rootDirPath: rootDirPath,
+      wipeOnLayoutMismatch: wipeOnLayoutMismatch,
+    );
+
+    return MultiIsolateKvStoreClient._(
+      null,
+      rootDirPath,
+      folderHierarchyLevels,
+      0,
+      KvPathCache(maxEntries: pathCacheMaxEntries),
+    );
   }
 
   /// Spawns the router and write worker pool. Returns a client bound to that router.
@@ -50,14 +127,9 @@ class MultiIsolateKvStoreClient {
     Duration flushInterval = const Duration(milliseconds: 100),
     int writeMaxInFlightChunks = 8,
     bool wipeOnLayoutMismatch = true,
+    int pathCacheMaxEntries = 4096,
   }) async {
-    if (rootDirPath.isEmpty) {
-      throw ArgumentError.value(
-        rootDirPath,
-        'rootDirPath',
-        'must not be empty',
-      );
-    }
+    _validateRootDirPath(rootDirPath);
     if (numWriteWorkers <= 0) {
       throw ArgumentError.value(
         numWriteWorkers,
@@ -65,13 +137,7 @@ class MultiIsolateKvStoreClient {
         'must be greater than zero',
       );
     }
-    if (folderHierarchyLevels < 0 || folderHierarchyLevels > 2) {
-      throw ArgumentError.value(
-        folderHierarchyLevels,
-        'folderHierarchyLevels',
-        'must be 0, 1, or 2',
-      );
-    }
+    _validateFolderHierarchyLevels(folderHierarchyLevels);
     if (writeIdlePurgeDuration.isNegative) {
       throw ArgumentError.value(
         writeIdlePurgeDuration,
@@ -97,6 +163,13 @@ class MultiIsolateKvStoreClient {
       throw ArgumentError.value(
         writeMaxInFlightChunks,
         'writeMaxInFlightChunks',
+        'must not be negative',
+      );
+    }
+    if (pathCacheMaxEntries < 0) {
+      throw ArgumentError.value(
+        pathCacheMaxEntries,
+        'pathCacheMaxEntries',
         'must not be negative',
       );
     }
@@ -126,19 +199,43 @@ class MultiIsolateKvStoreClient {
       rootDirPath,
       folderHierarchyLevels,
       writeMaxInFlightChunks,
+      KvPathCache(maxEntries: pathCacheMaxEntries),
     );
+  }
+
+  static void _validateRootDirPath(String rootDirPath) {
+    if (rootDirPath.isEmpty) {
+      throw ArgumentError.value(
+        rootDirPath,
+        'rootDirPath',
+        'must not be empty',
+      );
+    }
+  }
+
+  static void _validateFolderHierarchyLevels(int folderHierarchyLevels) {
+    if (folderHierarchyLevels < 0 || folderHierarchyLevels > 2) {
+      throw ArgumentError.value(
+        folderHierarchyLevels,
+        'folderHierarchyLevels',
+        'must be 0, 1, or 2',
+      );
+    }
   }
 
   /// Shuts down router, worker, and folder isolates. Idempotent.
   ///
-  /// After close, write/delete/subscribe operations throw [StateError].
-  /// Direct reads via [readStream] remain available.
+  /// For read-only clients this only marks the client closed. Direct reads
+  /// via [readStream] and [readBytes] remain available until [close].
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
 
+    final routerPort = _routerPort;
+    if (routerPort == null) return;
+
     final replyPort = ReceivePort();
-    _routerPort.send(<String, dynamic>{
+    routerPort.send(<String, dynamic>{
       'type': 'shutdown',
       'replyPort': replyPort.sendPort,
     });
@@ -153,15 +250,22 @@ class MultiIsolateKvStoreClient {
     String extension = 'bin',
     bool truncateExisting = true,
   }) async {
-    _ensureOpen();
+    _ensureWriteCapable();
+    final routerPort = _routerPort!;
+
+    ReceivePort? creditPort;
+    if (_writeMaxInFlightChunks > 0) {
+      creditPort = ReceivePort();
+    }
 
     final replyPort = ReceivePort();
-    _routerPort.send(<String, dynamic>{
+    routerPort.send(<String, dynamic>{
       'type': 'openWrite',
       'key': key,
       'ext': extension,
       'truncate': truncateExisting,
       'replyPort': replyPort.sendPort,
+      if (creditPort != null) 'creditPort': creditPort.sendPort,
     });
 
     final ack = await replyPort.first as Map;
@@ -171,22 +275,10 @@ class MultiIsolateKvStoreClient {
     final writeId = ack['writeId'] as int;
     final workerPort = ack['workerPort'] as SendPort;
 
-    ReceivePort? creditPort;
     StreamIterator<dynamic>? creditIterator;
     var credits = _writeMaxInFlightChunks;
-    if (_writeMaxInFlightChunks > 0) {
-      creditPort = ReceivePort();
+    if (creditPort != null) {
       creditIterator = StreamIterator<dynamic>(creditPort);
-      final creditsReply = ReceivePort();
-      workerPort.send(<String, dynamic>{
-        'type': 'registerCredits',
-        'writeId': writeId,
-        'creditPort': creditPort.sendPort,
-        'replyPort': creditsReply.sendPort,
-      });
-      final creditsAck = await creditsReply.first as Map;
-      creditsReply.close();
-      kvThrowIfError(creditsAck);
     }
 
     try {
@@ -234,14 +326,39 @@ class MultiIsolateKvStoreClient {
     kvThrowIfError(endAck);
   }
 
+  /// Caller-isolate write bypassing worker isolates.
+  ///
+  /// Uses the same atomic truncate semantics as worker writes but does not
+  /// notify live subscribers. Suitable for bulk ingest when isolation is not
+  /// needed.
+  Future<void> writeFromStreamDirect(
+    String key,
+    Stream<List<int>> data, {
+    String extension = 'bin',
+    bool truncateExisting = true,
+  }) async {
+    _ensureOpen();
+    final direct = KvDirectIo(
+      rootDirPath: _rootDirPath,
+      folderHierarchyLevels: _folderHierarchyLevels,
+    );
+    await direct.writeFromStream(
+      key,
+      data,
+      extension: extension,
+      truncateExisting: truncateExisting,
+    );
+  }
+
   Stream<List<int>> subscribeLive(
     String key, {
     String extension = 'bin',
   }) {
-    _ensureOpen();
+    _ensureWriteCapable();
+    final routerPort = _routerPort!;
 
     final recv = ReceivePort();
-    _routerPort.send(<String, dynamic>{
+    routerPort.send(<String, dynamic>{
       'type': 'subscribeLive',
       'key': key,
       'ext': extension,
@@ -266,17 +383,12 @@ class MultiIsolateKvStoreClient {
 
   /// File path for [key], using this client's [rootDirPath].
   String pathForKey(String key, {String extension = 'bin'}) {
-    return HashedKvPath.pathForKey(
-      _rootDirPath,
-      key,
-      extension,
-      _folderHierarchyLevels,
-    );
+    return _resolvePath(_rootDirPath, key, extension);
   }
 
   /// Whether a value exists for [key] and [extension] on disk.
   Future<bool> exists(String key, {String extension = 'bin'}) async {
-    return File(pathForKey(key, extension: extension)).exists();
+    return _fileFor(_rootDirPath, key, extension).exists();
   }
 
   /// Lists stored file paths relative to [rootDirPath].
@@ -321,12 +433,72 @@ class MultiIsolateKvStoreClient {
     ).hasMatch(stem);
   }
 
+  /// Read the full value as bytes in the caller isolate.
+  Future<Uint8List> readBytes(
+    String key, {
+    String extension = 'bin',
+    bool checkExists = true,
+  }) {
+    return _readBytesAt(
+      _rootDirPath,
+      key,
+      extension: extension,
+      checkExists: checkExists,
+    );
+  }
+
+  Future<Uint8List> _readBytesAt(
+    String rootDirPath,
+    String key, {
+    required String extension,
+    required bool checkExists,
+  }) async {
+    final file = _fileFor(rootDirPath, key, extension);
+
+    try {
+      return await file.readAsBytes();
+    } catch (e) {
+      if (checkExists && kvIsNotFoundError(e)) {
+        throw KvNotFoundException(key, extension);
+      }
+      rethrow;
+    }
+  }
+
+  /// Reads many keys concurrently in the caller isolate.
+  Future<Map<String, Uint8List>> readBytesAll(
+    Iterable<String> keys, {
+    String extension = 'bin',
+    bool checkExists = true,
+  }) async {
+    final keyList = keys is List<String> ? keys : keys.toList(growable: false);
+    final entries = await Future.wait(
+      keyList.map(
+        (key) async => MapEntry(
+          key,
+          await readBytes(
+            key,
+            extension: extension,
+            checkExists: checkExists,
+          ),
+        ),
+      ),
+    );
+    return Map.fromEntries(entries);
+  }
+
   /// Read using this client's [rootDirPath].
   Stream<List<int>> readStream(
     String key, {
     String extension = 'bin',
+    bool checkExists = true,
   }) {
-    return _readStreamAt(_rootDirPath, key, extension: extension);
+    return _readStreamAt(
+      _rootDirPath,
+      key,
+      extension: extension,
+      checkExists: checkExists,
+    );
   }
 
   /// Read using an explicit [rootDirPath] (e.g. when sharing path logic across clients).
@@ -334,38 +506,55 @@ class MultiIsolateKvStoreClient {
     String rootDirPath,
     String key, {
     String extension = 'bin',
+    bool checkExists = true,
   }) {
-    return _readStreamAt(rootDirPath, key, extension: extension);
+    return _readStreamAt(
+      rootDirPath,
+      key,
+      extension: extension,
+      checkExists: checkExists,
+    );
   }
 
   Stream<List<int>> _readStreamAt(
     String rootDirPath,
     String key, {
     required String extension,
+    required bool checkExists,
   }) async* {
-    final filePath = HashedKvPath.pathForKey(
-      rootDirPath,
-      key,
-      extension,
-      _folderHierarchyLevels,
-    );
-    final file = File(filePath);
+    final file = _fileFor(rootDirPath, key, extension);
 
-    if (!await file.exists()) {
-      throw KvNotFoundException(key, extension);
-    }
-
-    final stream = file.openRead();
-    await for (final chunk in stream) {
-      yield chunk;
+    try {
+      await for (final chunk in file.openRead()) {
+        yield chunk;
+      }
+    } catch (e) {
+      if (checkExists && kvIsNotFoundError(e)) {
+        throw KvNotFoundException(key, extension);
+      }
+      rethrow;
     }
   }
 
-  Future<void> delete(String key, {String extension = 'bin'}) async {
+  /// Deletes a key directly in the caller isolate.
+  ///
+  /// Does not coordinate with active worker writes for the same key. Prefer
+  /// [delete] when a spawned client may have in-flight writes.
+  Future<void> deleteLocal(String key, {String extension = 'bin'}) async {
     _ensureOpen();
+    final direct = KvDirectIo(
+      rootDirPath: _rootDirPath,
+      folderHierarchyLevels: _folderHierarchyLevels,
+    );
+    await direct.delete(key, extension: extension);
+  }
+
+  Future<void> delete(String key, {String extension = 'bin'}) async {
+    _ensureWriteCapable();
+    final routerPort = _routerPort!;
 
     final replyPort = ReceivePort();
-    _routerPort.send(<String, dynamic>{
+    routerPort.send(<String, dynamic>{
       'type': 'delete',
       'key': key,
       'ext': extension,

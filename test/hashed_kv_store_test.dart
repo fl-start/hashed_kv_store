@@ -962,6 +962,122 @@ void main() {
     );
   });
 
+  group('read optimizations', () {
+    test('readBytes returns full value', () async {
+      const key = 'bytes:test';
+      const content = 'read-bytes-payload';
+      await store.writeFromStream(
+        key,
+        Stream.value(utf8.encode(content)),
+        extension: 'txt',
+      );
+
+      final bytes = await store.readBytes(key, extension: 'txt');
+      expect(utf8.decode(bytes), equals(content));
+    });
+
+    test('readBytes with checkExists true on missing key throws KvNotFoundException',
+        () async {
+      await expectLater(
+        store.readBytes('missing:bytes'),
+        throwsA(isA<KvNotFoundException>()),
+      );
+    });
+
+    test('readBytes with checkExists false on missing key throws on read', () async {
+      await expectLater(
+        store.readBytes('missing:bytes', checkExists: false),
+        throwsA(isA<FileSystemException>()),
+      );
+    });
+
+    test('readStream with checkExists false skips exists probe', () async {
+      const key = 'nocheck:stream';
+      await store.writeFromStream(
+        key,
+        Stream.value([9, 8, 7]),
+        extension: 'bin',
+      );
+
+      final bytes = <int>[];
+      await for (final chunk
+          in store.readStream(key, checkExists: false)) {
+        bytes.addAll(chunk);
+      }
+      expect(bytes, equals([9, 8, 7]));
+    });
+
+    test('readBytesAll reads many keys concurrently', () async {
+      await store.writeFromStream('batch:a', Stream.value([1]));
+      await store.writeFromStream('batch:b', Stream.value([2, 3]));
+
+      final all = await store.readBytesAll(['batch:a', 'batch:b']);
+      expect(all['batch:a'], equals([1]));
+      expect(all['batch:b'], equals([2, 3]));
+    });
+
+    test('path cache returns consistent paths', () async {
+      final first = store.pathForKey('cache:key', extension: 'bin');
+      final second = store.pathForKey('cache:key', extension: 'bin');
+      expect(second, equals(first));
+    });
+  });
+
+  group('read-only client', () {
+    late Directory readOnlyDir;
+    late MultiIsolateKvStoreClient readOnly;
+
+    setUp(() async {
+      readOnlyDir = await Directory.systemTemp.createTemp('kv_readonly_');
+      readOnly = await MultiIsolateKvStoreClient.openReadOnly(
+        rootDirPath: readOnlyDir.path,
+      );
+    });
+
+    tearDown(() async {
+      await readOnly.close();
+      if (await readOnlyDir.exists()) {
+        await readOnlyDir.delete(recursive: true);
+      }
+    });
+
+    test('isReadOnly and write operations throw', () async {
+      expect(readOnly.isReadOnly, isTrue);
+      expect(
+        () => readOnly.writeFromStream('k', Stream.value([1])),
+        throwsA(isA<StateError>()),
+      );
+      expect(
+        () => readOnly.delete('k'),
+        throwsA(isA<StateError>()),
+      );
+      expect(
+        () => readOnly.subscribeLive('k'),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('writeFromStreamDirect and read work without isolates', () async {
+      const key = 'ro:direct';
+      await readOnly.writeFromStreamDirect(
+        key,
+        Stream.value(utf8.encode('direct')),
+        extension: 'txt',
+      );
+      expect(await readOnly.exists(key, extension: 'txt'), isTrue);
+      final bytes = await readOnly.readBytes(key, extension: 'txt');
+      expect(utf8.decode(bytes), equals('direct'));
+    });
+
+    test('deleteLocal removes file', () async {
+      const key = 'ro:delete';
+      await readOnly.writeFromStreamDirect(key, Stream.value([5]));
+      expect(await readOnly.exists(key), isTrue);
+      await readOnly.deleteLocal(key);
+      expect(await readOnly.exists(key), isFalse);
+    });
+  });
+
   test('queued write drains after open failure in worker queue', () async {
     const key = 'open:fail:drain';
     const ext = 'txt';

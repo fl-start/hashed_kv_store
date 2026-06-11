@@ -1,3 +1,29 @@
+## 0.3.3
+
+### Fixed
+
+- `readStream` no longer chains `exists()` + `stat()` + `readAsBytes()`; uses optimistic `openRead()` (one syscall on hit)
+- `readBytes(checkExists: true)` uses optimistic read instead of `exists()` + `readAsBytes()`
+
+### Removed
+
+- `smallFileReadThreshold` spawn/openReadOnly option (small-file `readStream` fast path caused a regression on Windows)
+
+## 0.3.2
+
+### Added
+
+- `readBytes()`, `readBytesAll()`, and `readStream(checkExists: false)` for faster small-file reads
+- `openReadOnly()` — read-only client without write isolates
+- `writeFromStreamDirect()` and `deleteLocal()` for caller-isolate I/O
+- LRU path cache (`pathCacheMaxEntries` on spawn/openReadOnly)
+- Small-file `readStream` fast path via `readAsBytes` (`smallFileReadThreshold`, default 64 KiB)
+- `KvDirectIo` exported for aligned direct disk I/O
+
+### Changed
+
+- `openWrite` registers write backpressure credits in the same round trip (no separate `registerCredits` hop)
+
 ## 0.3.1
 
 ### Added

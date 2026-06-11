@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:isolate';
 
 /// Thrown when a value for a given key does not exist on disk.
@@ -65,6 +66,26 @@ void kvSendError(SendPort? port, Object error, [StackTrace? stackTrace]) {
 
 void kvSendOk(SendPort? port, [Map<String, dynamic>? extra]) {
   port?.send(<String, dynamic>{'ok': true, ...?extra});
+}
+
+/// Whether [error] indicates the target path does not exist.
+bool kvIsPathNotFound(FileSystemException error) {
+  final code = error.osError?.errorCode;
+  if (code == 2 || code == 3) {
+    return true;
+  }
+  final message = error.message.toLowerCase();
+  return message.contains('no such file') ||
+      message.contains('not found') ||
+      message.contains('cannot find');
+}
+
+/// Whether a read/open error indicates the target path does not exist.
+bool kvIsNotFoundError(Object error) {
+  if (error is PathNotFoundException) {
+    return true;
+  }
+  return error is FileSystemException && kvIsPathNotFound(error);
 }
 
 void kvThrowIfError(Map<dynamic, dynamic> response) {

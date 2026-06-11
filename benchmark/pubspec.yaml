@@ -1,0 +1,13 @@
+name: hashed_kv_store_benchmark
+description: Latency benchmarks for isolate vs direct disk I/O.
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  hashed_kv_store:
+    path: ../
+
+dev_dependencies:
+  lints: ^5.0.0

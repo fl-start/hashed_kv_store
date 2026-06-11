@@ -32,6 +32,7 @@ class _QueuedWrite {
   final bool truncate;
   final SendPort replyPort;
   final String? filePath;
+  final SendPort? creditPort;
 
   _QueuedWrite({
     required this.key,
@@ -39,6 +40,7 @@ class _QueuedWrite {
     required this.truncate,
     required this.replyPort,
     this.filePath,
+    this.creditPort,
   });
 }
 
@@ -287,6 +289,19 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     pendingDeletesForKey.remove(k);
   }
 
+  void registerWriteCredits(int writeId, SendPort? creditPort) {
+    if (creditPort != null) {
+      creditPortsForWrite[writeId] = creditPort;
+    }
+  }
+
+  void sendOpenWriteAck(SendPort replyPort, int writeId) {
+    replyPort.send(<String, dynamic>{
+      'writeId': writeId,
+      'workerPort': cmdPort.sendPort,
+    });
+  }
+
   Future<void> startQueuedWrite(String k) async {
     final queue = pendingWritesForKey[k];
     if (queue == null || queue.isEmpty) return;
@@ -308,10 +323,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         filePath: next.filePath,
       );
       writes[newWriteId] = ctx;
-      next.replyPort.send(<String, dynamic>{
-        'writeId': newWriteId,
-        'workerPort': cmdPort.sendPort,
-      });
+      registerWriteCredits(newWriteId, next.creditPort);
+      sendOpenWriteAck(next.replyPort, newWriteId);
     } catch (e, st) {
       activeWriteIdForKey[k] = null;
       kvSendError(next.replyPort, e, st);
@@ -379,6 +392,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
                   truncate: truncate,
                   replyPort: replyPort,
                   filePath: filePath,
+                  creditPort: cmd['creditPort'] as SendPort?,
                 ));
             scheduleIdleCheckIfNeeded();
             break;
@@ -396,10 +410,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
               filePath: filePath,
             );
             writes[writeId] = ctx;
-            replyPort.send(<String, dynamic>{
-              'writeId': writeId,
-              'workerPort': cmdPort.sendPort,
-            });
+            registerWriteCredits(writeId, cmd['creditPort'] as SendPort?);
+            sendOpenWriteAck(replyPort, writeId);
           } catch (e, st) {
             activeWriteIdForKey[k] = null;
             kvSendError(replyPort, e, st);
