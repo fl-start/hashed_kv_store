@@ -243,6 +243,7 @@ void main() {
     final allEntries = tempDir
         .listSync(recursive: true)
         .whereType<File>()
+        .where((f) => !p.basename(f.path).startsWith('.'))
         .map((f) => f.path)
         .toList();
 
@@ -1025,5 +1026,121 @@ void main() {
     expect(utf8.decode(bytes), equals('three'));
   }, onPlatform: {
     'windows': Skip('Timing-sensitive queue drain test'),
+  });
+
+  group('layout version migration', () {
+    test('fresh root writes metadata and preserves data across respawn', () async {
+      final dir = await Directory.systemTemp.createTemp('kv_layout_fresh_');
+      try {
+        final first = await MultiIsolateKvStoreClient.spawn(
+          rootDirPath: dir.path,
+          numWriteWorkers: 1,
+        );
+        await first.writeFromStream(
+          'persist',
+          Stream.value(utf8.encode('ok')),
+          extension: 'txt',
+        );
+        await first.close();
+
+        final meta = File(kvStoreMetaFilePath(dir.path));
+        expect(await meta.exists(), isTrue);
+        expect(
+          jsonDecode(await meta.readAsString()),
+          equals(<String, dynamic>{'layoutVersion': kKvStoreLayoutVersion}),
+        );
+
+        final second = await MultiIsolateKvStoreClient.spawn(
+          rootDirPath: dir.path,
+          numWriteWorkers: 1,
+        );
+        final bytes = <int>[];
+        await for (final chunk in second.readStream('persist', extension: 'txt')) {
+          bytes.addAll(chunk);
+        }
+        expect(utf8.decode(bytes), equals('ok'));
+        await second.close();
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    test('stale metadata triggers wipe on spawn', () async {
+      final dir = await Directory.systemTemp.createTemp('kv_layout_stale_');
+      try {
+        await dir.create(recursive: true);
+        final staleKeyPath = p.join(dir.path, 'stale-marker.txt');
+        await File(staleKeyPath).writeAsString('old');
+
+        await File(kvStoreMetaFilePath(dir.path)).writeAsString(
+          jsonEncode(<String, dynamic>{'layoutVersion': 0}),
+        );
+
+        final client = await MultiIsolateKvStoreClient.spawn(
+          rootDirPath: dir.path,
+          numWriteWorkers: 1,
+        );
+        expect(await File(staleKeyPath).exists(), isFalse);
+        await client.writeFromStream(
+          'new',
+          Stream.value(utf8.encode('fresh')),
+          extension: 'txt',
+        );
+        await client.close();
+
+        final meta = jsonDecode(
+          await File(kvStoreMetaFilePath(dir.path)).readAsString(),
+        ) as Map<String, dynamic>;
+        expect(meta['layoutVersion'], equals(kKvStoreLayoutVersion));
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    test('legacy files without metadata are wiped on spawn', () async {
+      final dir = await Directory.systemTemp.createTemp('kv_layout_legacy_');
+      try {
+        final legacyFile = File(
+          p.join(
+            dir.path,
+            'ab',
+            'cd',
+            '${'a' * 64}.txt',
+          ),
+        );
+        await legacyFile.parent.create(recursive: true);
+        await legacyFile.writeAsString('legacy');
+
+        final client = await MultiIsolateKvStoreClient.spawn(
+          rootDirPath: dir.path,
+          numWriteWorkers: 1,
+        );
+        expect(await legacyFile.exists(), isFalse);
+        expect(await dir.exists(), isTrue);
+        await client.close();
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    test('wipeOnLayoutMismatch false throws on mismatch', () async {
+      final dir = await Directory.systemTemp.createTemp('kv_layout_optout_');
+      try {
+        await File(kvStoreMetaFilePath(dir.path)).writeAsString(
+          jsonEncode(<String, dynamic>{'layoutVersion': 0}),
+        );
+
+        await expectLater(
+          () => MultiIsolateKvStoreClient.spawn(
+            rootDirPath: dir.path,
+            numWriteWorkers: 1,
+            wipeOnLayoutMismatch: false,
+          ),
+          throwsA(isA<KvLayoutMismatchException>()),
+        );
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    });
   });
 }

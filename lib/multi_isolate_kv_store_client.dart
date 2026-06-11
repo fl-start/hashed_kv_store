@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 
 import 'hashed_kv_path.dart';
 import 'kv_exceptions.dart';
+import 'kv_layout_migration.dart';
 import 'kv_router_isolate.dart';
 
 export 'kv_exceptions.dart';
@@ -48,6 +49,7 @@ class MultiIsolateKvStoreClient {
     int flushThresholdBytes = 64 * 1024,
     Duration flushInterval = const Duration(milliseconds: 100),
     int writeMaxInFlightChunks = 8,
+    bool wipeOnLayoutMismatch = true,
   }) async {
     if (rootDirPath.isEmpty) {
       throw ArgumentError.value(
@@ -98,6 +100,11 @@ class MultiIsolateKvStoreClient {
         'must not be negative',
       );
     }
+
+    await ensureKvStoreLayout(
+      rootDirPath: rootDirPath,
+      wipeOnLayoutMismatch: wipeOnLayoutMismatch,
+    );
 
     final init = ReceivePort();
     await Isolate.spawn(

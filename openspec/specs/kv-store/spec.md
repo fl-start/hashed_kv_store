@@ -234,6 +234,29 @@ The system SHALL provide `exists(key)` and `listStoredPaths()` on [MultiIsolateK
 - **WHEN** a caller invokes `listStoredPaths` after writing values
 - **THEN** hashed relative file paths are returned without temp files
 
+### Requirement: Layout Version Metadata
+
+The system SHALL write `.hashed_kv_meta.json` under the storage root containing a `layoutVersion` integer that matches the package's current on-disk layout version.
+
+#### Scenario: Fresh root writes metadata
+
+- **WHEN** `MultiIsolateKvStoreClient.spawn` is called on an empty root directory
+- **THEN** layout metadata is written without deleting the root directory
+
+### Requirement: Layout Mismatch Handling
+
+When stored layout metadata is missing and the root contains files, or when stored `layoutVersion` does not match the package layout version, the system SHALL wipe all contents under the root (except the root directory itself) before writing fresh metadata, unless `wipeOnLayoutMismatch` is false.
+
+#### Scenario: Legacy data without metadata
+
+- **WHEN** spawn is called on a root with files but no layout metadata
+- **THEN** existing files are removed and fresh metadata is written
+
+#### Scenario: Opt out of automatic wipe
+
+- **WHEN** spawn is called with `wipeOnLayoutMismatch: false` and layout versions mismatch
+- **THEN** spawn throws `KvLayoutMismatchException` without modifying stored files
+
 ### Requirement: Multi-Isolate Write Architecture
 
 The system SHALL use a router isolate, a master folder isolate, and a configurable pool of write worker isolates sharded by key.

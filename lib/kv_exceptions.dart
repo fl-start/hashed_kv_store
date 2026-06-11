@@ -12,6 +12,24 @@ class KvNotFoundException implements Exception {
       'KvNotFoundException: No value found for key="$key" (.$extension)';
 }
 
+/// Thrown when on-disk layout metadata does not match the package layout version.
+class KvLayoutMismatchException implements Exception {
+  final String rootDirPath;
+  final int? storedVersion;
+  final int expectedVersion;
+
+  KvLayoutMismatchException({
+    required this.rootDirPath,
+    required this.storedVersion,
+    required this.expectedVersion,
+  });
+
+  @override
+  String toString() =>
+      'KvLayoutMismatchException: layout version mismatch at "$rootDirPath" '
+      '(stored: $storedVersion, expected: $expectedVersion)';
+}
+
 /// Thrown when a write operation fails in a worker or folder isolate.
 class KvWriteException implements Exception {
   final String message;

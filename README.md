@@ -25,7 +25,7 @@ Add this package to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  hashed_kv_store: ^0.3.0
+  hashed_kv_store: ^0.3.1
 ```
 
 ## Usage
@@ -170,7 +170,7 @@ await store.writeFromStream(key, response.data!.stream, extension: ext);
 
 ### MultiIsolateKvStoreClient
 
-#### `spawn({required String rootDirPath, int numWriteWorkers = 2, int folderHierarchyLevels = 1, Duration writeIdlePurgeDuration = const Duration(seconds: 60), bool fsyncOnClose = false, int flushThresholdBytes = 65536, Duration flushInterval = const Duration(milliseconds: 100), int writeMaxInFlightChunks = 8})`
+#### `spawn({required String rootDirPath, int numWriteWorkers = 2, int folderHierarchyLevels = 1, Duration writeIdlePurgeDuration = const Duration(seconds: 60), bool fsyncOnClose = false, int flushThresholdBytes = 65536, Duration flushInterval = const Duration(milliseconds: 100), int writeMaxInFlightChunks = 8, bool wipeOnLayoutMismatch = true})`
 
 Spawns the router and write workers. Returns a client bound to that router.
 
@@ -182,6 +182,9 @@ Spawns the router and write workers. Returns a client bound to that router.
 - `flushThresholdBytes`: Flush sink after chunks of this size (default: 65536)
 - `flushInterval`: Time-based flush interval for live subscribers (default: 100ms)
 - `writeMaxInFlightChunks`: Backpressure window for in-flight chunks; 0 disables (default: 8)
+- `wipeOnLayoutMismatch`: When true (default), incompatible or legacy on-disk data is deleted on first spawn; set false to throw `KvLayoutMismatchException` instead
+
+On first spawn, the store writes `.hashed_kv_meta.json` under `rootDirPath` with a layout version. If metadata is missing but files exist (legacy installs), or the stored layout version does not match the package, the root contents are wiped automatically before use.
 
 #### `writeFromStream(String key, Stream<List<int>> data, {String extension = 'bin', bool truncateExisting = true})`
 

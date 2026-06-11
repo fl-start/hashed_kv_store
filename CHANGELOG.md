@@ -1,3 +1,11 @@
+## 0.3.1
+
+### Added
+
+- Layout version metadata (`.hashed_kv_meta.json`) written on spawn
+- Automatic wipe of incompatible or legacy on-disk data when layout version mismatches
+- `wipeOnLayoutMismatch` spawn option (default `true`) and `KvLayoutMismatchException` when disabled
+
 ## 0.3.0
 
 ### Added
