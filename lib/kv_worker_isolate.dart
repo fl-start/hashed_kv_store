@@ -182,6 +182,22 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     endChannel(key, ext);
   }
 
+  Future<void> cleanupStaleTempFiles(File targetFile) async {
+    final parent = targetFile.parent;
+    if (!await parent.exists()) return;
+
+    final prefix = '${targetFile.path}.';
+    await for (final entity in parent.list()) {
+      if (entity is! File) continue;
+      final name = entity.path;
+      if (name.startsWith(prefix) && name.endsWith('.tmp')) {
+        try {
+          await entity.delete();
+        } catch (_) {}
+      }
+    }
+  }
+
   Future<_WriteContext> openWriteContext({
     required String key,
     required String ext,
@@ -192,6 +208,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     final targetFile = fileFor(key, ext, filePath: filePath);
     final now = DateTime.now();
     if (truncate) {
+      await cleanupStaleTempFiles(targetFile);
       final tempFile = File('${targetFile.path}.$writeId.tmp');
       final sink = tempFile.openWrite();
       return _WriteContext(

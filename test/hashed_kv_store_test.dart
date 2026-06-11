@@ -911,4 +911,119 @@ void main() {
       }
     }
   });
+
+  test('stale truncate temp files are removed on new truncate write', () async {
+    const key = 'temp:cleanup';
+    const ext = 'txt';
+    final path = store.pathForKey(key, extension: ext);
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('old')),
+      extension: ext,
+    );
+
+    final orphan = File('$path.999.tmp');
+    await orphan.writeAsString('orphan');
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('new')),
+      extension: ext,
+    );
+
+    expect(await orphan.exists(), isFalse);
+    final bytes = <int>[];
+    await for (final chunk in store.readStream(key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals('new'));
+  });
+
+  test('exists and listStoredPaths report stored values', () async {
+    await store.writeFromStream('alpha', Stream.value([1]), extension: 'bin');
+    await store.writeFromStream('beta', Stream.value([2]), extension: 'txt');
+
+    expect(await store.exists('alpha', extension: 'bin'), isTrue);
+    expect(await store.exists('beta', extension: 'txt'), isTrue);
+    expect(await store.exists('gamma', extension: 'bin'), isFalse);
+
+    final paths = await store.listStoredPaths();
+    expect(paths.length, equals(2));
+    expect(paths.every((path) => !path.contains('.tmp')), isTrue);
+    expect(
+      paths.every(
+        (path) => RegExp(
+          r'(^|[/\\])[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}\.[0-9a-z]+$',
+        ).hasMatch(path),
+      ),
+      isTrue,
+    );
+  });
+
+  test('queued write drains after open failure in worker queue', () async {
+    const key = 'open:fail:drain';
+    const ext = 'txt';
+
+    await store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('seed')),
+      extension: ext,
+    );
+
+    final path = store.pathForKey(key, extension: ext);
+    final hold = StreamController<List<int>>();
+    var w1Done = false;
+    final w1 = store
+        .writeFromStream(key, hold.stream, extension: ext)
+        .whenComplete(() => w1Done = true);
+    hold.add(utf8.encode('one'));
+
+    final w2 = store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('two')),
+      extension: ext,
+      truncateExisting: false,
+    );
+    final w3 = store.writeFromStream(
+      key,
+      Stream.value(utf8.encode('three')),
+      extension: ext,
+    );
+
+    unawaited(() async {
+      while (!w1Done) {
+        await Future.delayed(const Duration(microseconds: 100));
+      }
+      for (var i = 0; i < 300; i++) {
+        if (await File(path).exists()) {
+          try {
+            await File(path).delete();
+            await Directory(path).create();
+            return;
+          } catch (_) {}
+        }
+        await Future.delayed(const Duration(microseconds: 100));
+      }
+    }());
+
+    hold.close();
+    await w1;
+
+    await expectLater(w2, throwsA(isA<KvWriteException>()));
+
+    if (await Directory(path).exists()) {
+      await Directory(path).delete(recursive: true);
+    }
+
+    await w3;
+
+    final bytes = <int>[];
+    await for (final chunk in store.readStream(key, extension: ext)) {
+      bytes.addAll(chunk);
+    }
+    expect(utf8.decode(bytes), equals('three'));
+  }, onPlatform: {
+    'windows': Skip('Timing-sensitive queue drain test'),
+  });
 }

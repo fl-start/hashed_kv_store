@@ -1,6 +1,6 @@
 name: hashed_kv_store
 description: SHA256-based key/value store with streaming IO and multi-isolate support.
-version: 0.2.0
+version: 0.3.0
 homepage: https://github.com/fl-start/hashed_kv_store
 repository: https://github.com/fl-start/hashed_kv_store
 issue_tracker: https://github.com/fl-start/hashed_kv_store/issues

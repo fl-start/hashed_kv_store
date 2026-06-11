@@ -193,6 +193,47 @@ Append writes (`truncateExisting: false`) SHALL write directly to the target fil
 - **WHEN** a caller appends to an existing key
 - **THEN** the write does not use temp-file rename semantics
 
+### Requirement: Write Channel I/O Failure Semantics
+
+When an active write fails due to chunk or commit I/O for a `(key, extension)` channel, the system SHALL fail queued writes and deletes for that same channel to avoid ambiguous partial state.
+
+#### Scenario: Queued operations fail with active write I/O error
+
+- **WHEN** an active write fails during chunk or commit I/O and other writes are queued for the same key and extension
+- **THEN** the queued write futures complete with errors
+
+### Requirement: Open Failure Queue Drain
+
+When a queued write fails to open, the system SHALL attempt to start the next queued write for the same `(key, extension)` channel.
+
+#### Scenario: Queued write after open failure
+
+- **WHEN** a queued write fails during open and another write remains queued for the same key and extension
+- **THEN** the next queued write is started
+
+### Requirement: Stale Temp File Cleanup
+
+Before starting a truncate write, the system SHALL delete stale `.<writeId>.tmp` files that belong to the target file path.
+
+#### Scenario: Orphan temp removed before truncate
+
+- **WHEN** a truncate write opens for a key with orphan temp siblings present
+- **THEN** those stale temp files are removed before the new temp file is created
+
+### Requirement: Storage Introspection
+
+The system SHALL provide `exists(key)` and `listStoredPaths()` on [MultiIsolateKvStoreClient]. `listStoredPaths` SHALL return hashed storage paths relative to the root and SHALL NOT recover original string keys.
+
+#### Scenario: Exists check
+
+- **WHEN** a caller checks `exists` for a stored key
+- **THEN** the result is true
+
+#### Scenario: List stored paths
+
+- **WHEN** a caller invokes `listStoredPaths` after writing values
+- **THEN** hashed relative file paths are returned without temp files
+
 ### Requirement: Multi-Isolate Write Architecture
 
 The system SHALL use a router isolate, a master folder isolate, and a configurable pool of write worker isolates sharded by key.

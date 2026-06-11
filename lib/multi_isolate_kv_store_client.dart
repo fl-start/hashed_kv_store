@@ -3,6 +3,8 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:path/path.dart' as p;
+
 import 'hashed_kv_path.dart';
 import 'kv_exceptions.dart';
 import 'kv_router_isolate.dart';
@@ -263,6 +265,53 @@ class MultiIsolateKvStoreClient {
       extension,
       _folderHierarchyLevels,
     );
+  }
+
+  /// Whether a value exists for [key] and [extension] on disk.
+  Future<bool> exists(String key, {String extension = 'bin'}) async {
+    return File(pathForKey(key, extension: extension)).exists();
+  }
+
+  /// Lists stored file paths relative to [rootDirPath].
+  ///
+  /// Original string keys cannot be recovered from hashed paths. Each entry is
+  /// a relative path such as `ab/ab12-3456-7890-cdef.bin`.
+  Future<List<String>> listStoredPaths() async {
+    final root = Directory(_rootDirPath);
+    if (!await root.exists()) return const [];
+
+    final paths = <String>[];
+    await _collectStoredPaths(root, '', paths);
+    paths.sort();
+    return paths;
+  }
+
+  Future<void> _collectStoredPaths(
+    Directory dir,
+    String relativePrefix,
+    List<String> out,
+  ) async {
+    await for (final entity in dir.list(followLinks: false)) {
+      if (entity is Directory) {
+        final name = p.basename(entity.path);
+        final nextPrefix =
+            relativePrefix.isEmpty ? name : p.join(relativePrefix, name);
+        await _collectStoredPaths(entity, nextPrefix, out);
+      } else if (entity is File && _looksLikeStoredValue(entity.path)) {
+        final name = p.basename(entity.path);
+        out.add(relativePrefix.isEmpty ? name : p.join(relativePrefix, name));
+      }
+    }
+  }
+
+  bool _looksLikeStoredValue(String filePath) {
+    if (filePath.contains('.tmp')) return false;
+    final fileName = p.basename(filePath);
+    final dot = fileName.lastIndexOf('.');
+    final stem = dot == -1 ? fileName : fileName.substring(0, dot);
+    return RegExp(
+      r'^[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$',
+    ).hasMatch(stem);
   }
 
   /// Read using this client's [rootDirPath].

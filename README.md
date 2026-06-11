@@ -25,7 +25,7 @@ Add this package to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  hashed_kv_store: ^0.2.0
+  hashed_kv_store: ^0.3.0
 ```
 
 ## Usage
@@ -75,6 +75,8 @@ final store = await MultiIsolateKvStoreClient.spawn(
 ```
 
 Flutter apps can define a constant (see `example/lib/main.dart`) and pass it to `spawn` so the nesting depth is configured in one place.
+
+A pure Dart (non-Flutter) example lives in [`example/dart_only/`](example/dart_only/).
 
 ### Live subscription (tail -f style)
 
@@ -190,6 +192,8 @@ Streaming write into the KV store.
 - Folder creation is handled by master folder isolate (centralized)
 - `extension`: File extension without leading dot (e.g., 'eml', 'bin')
 - `truncateExisting`: If true, overwrites existing file atomically via temp file + rename; otherwise appends directly to the target file. **Append mode is not atomic** — readers may observe partial content while an append is in progress.
+- If an active write fails due to a chunk or commit I/O error, queued writes and deletes for that same `(key, extension)` are failed as well. This avoids leaving the channel in an ambiguous partial state.
+- Truncate writes remove stale `.<writeId>.tmp` siblings for the target file before opening a new temp file.
 
 #### `readStream(String key, {String extension = 'bin'})`
 
@@ -203,6 +207,14 @@ Streaming read for the value stored under [key]/[extension], using the client's 
 #### `pathForKey(String key, {String extension = 'bin'})`
 
 Get the file path for a key on disk under the client's `rootDirPath`.
+
+#### `exists(String key, {String extension = 'bin'})`
+
+Returns whether a value is present on disk for the given key and extension.
+
+#### `listStoredPaths()`
+
+Lists stored file paths relative to `rootDirPath`. Original string keys cannot be recovered from hashed paths; this returns storage paths such as `ab/ab12-3456-7890-cdef.bin`.
 
 #### `subscribeLive(String key, {String extension = 'bin'})`
 

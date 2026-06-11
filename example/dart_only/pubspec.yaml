@@ -1,0 +1,10 @@
+name: hashed_kv_store_dart_example
+description: Pure Dart example for hashed_kv_store.
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  hashed_kv_store:
+    path: ../../
