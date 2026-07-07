@@ -1,3 +1,9 @@
+## 0.4.1
+
+### Fixed
+
+- CI dependency install no longer fails resolving the Flutter `example/` package on the Dart-only runner; `dart pub get --no-example` scopes resolution to the root package
+
 ## 0.4.0
 
 ### Added
