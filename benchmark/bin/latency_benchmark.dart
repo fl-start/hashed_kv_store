@@ -105,7 +105,8 @@ Future<void> main() async {
     warmup: _warmupIterations,
     run: () async {
       final bytes = <int>[];
-      await for (final chunk in store.readStream(readKey, extension: _extension)) {
+      await for (final chunk
+          in store.readStream(readKey, extension: _extension)) {
         bytes.addAll(chunk);
       }
     },
@@ -117,7 +118,8 @@ Future<void> main() async {
     warmup: _warmupIterations,
     run: () async {
       final bytes = <int>[];
-      await for (final chunk in direct.readStream(readKey, extension: _extension)) {
+      await for (final chunk
+          in direct.readStream(readKey, extension: _extension)) {
         bytes.addAll(chunk);
       }
     },
@@ -152,7 +154,8 @@ Future<void> main() async {
     run: (i) => direct.delete('bench:delete:$i', extension: _extension),
   );
 
-  final deleteScenario = _Scenario(id: 'D1', name: 'delete_4k', payload: const []);
+  final deleteScenario =
+      _Scenario(id: 'D1', name: 'delete_4k', payload: const []);
   results.add(_resultRow(deleteScenario, isolateDelete, directDelete));
   _printRow(deleteScenario, isolateDelete, directDelete);
 

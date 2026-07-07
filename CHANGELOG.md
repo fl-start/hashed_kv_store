@@ -1,3 +1,17 @@
+## 0.4.0
+
+### Added
+
+- `KvAbortController`, `KvAbortSignal`, and `KvAbortException` for cooperative cancellation
+- Optional `signal` parameter on `writeFromStream`, `writeFromStreamDirect`, `readBytes`, `readBytesAll`, and `readStream`
+- Router `abortWrite`, `openRead`, and `cancelRead` message handling
+- Worker-routed cancellable reads when `signal` is provided on a spawned client
+
+### Changed
+
+- Write aborts route through router `abortWrite` (replaces direct client `writeAbort` on cancellation)
+- Aborted truncate writes end live subscriptions and delete partial temp files
+
 ## 0.3.3
 
 ### Fixed

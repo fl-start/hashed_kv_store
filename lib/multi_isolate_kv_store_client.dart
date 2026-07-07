@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import 'hashed_kv_path.dart';
+import 'kv_abort.dart';
 import 'kv_direct_io.dart';
 import 'kv_exceptions.dart';
 import 'kv_layout_migration.dart';
@@ -22,6 +23,9 @@ class MultiIsolateKvStoreClient {
   final int _writeMaxInFlightChunks;
   final KvPathCache _pathCache;
   bool _closed = false;
+
+  static var _nextWriteRequestId = 1;
+  static var _nextReadRequestId = 1;
 
   MultiIsolateKvStoreClient._(
     this._routerPort,
@@ -249,9 +253,13 @@ class MultiIsolateKvStoreClient {
     Stream<List<int>> data, {
     String extension = 'bin',
     bool truncateExisting = true,
+    KvAbortSignal? signal,
   }) async {
+    signal?.throwIfAborted();
     _ensureWriteCapable();
     final routerPort = _routerPort!;
+
+    final writeRequestId = _nextWriteRequestId++;
 
     ReceivePort? creditPort;
     if (_writeMaxInFlightChunks > 0) {
@@ -265,10 +273,30 @@ class MultiIsolateKvStoreClient {
       'ext': extension,
       'truncate': truncateExisting,
       'replyPort': replyPort.sendPort,
+      'writeRequestId': writeRequestId,
       if (creditPort != null) 'creditPort': creditPort.sendPort,
     });
 
-    final ack = await replyPort.first as Map;
+    late Map<dynamic, dynamic> ack;
+    try {
+      if (signal != null) {
+        ack = await raceWithAbort(
+          replyPort.first.then((value) => value as Map<dynamic, dynamic>),
+          signal,
+        );
+      } else {
+        ack = await replyPort.first as Map<dynamic, dynamic>;
+      }
+    } on KvAbortException {
+      replyPort.close();
+      _sendAbortWrite(
+        routerPort: routerPort,
+        key: key,
+        extension: extension,
+        writeRequestId: writeRequestId,
+      );
+      rethrow;
+    }
     replyPort.close();
     kvThrowIfError(ack);
 
@@ -281,10 +309,32 @@ class MultiIsolateKvStoreClient {
       creditIterator = StreamIterator<dynamic>(creditPort);
     }
 
+    final input = StreamIterator<List<int>>(data);
+    var aborted = false;
+    void onAbort() {
+      aborted = true;
+      input.cancel();
+    }
+
+    signal?.onAbort(onAbort);
+
     try {
-      await for (final chunk in data) {
+      while (true) {
+        if (aborted) {
+          throw KvAbortException(signal?.reason);
+        }
+        signal?.throwIfAborted();
+
+        if (!await input.moveNext()) {
+          break;
+        }
+        final chunk = input.current;
+
         if (creditPort != null) {
           while (credits <= 0) {
+            if (aborted) {
+              throw KvAbortException(signal?.reason);
+            }
             final hasCredit = await creditIterator!.moveNext();
             if (!hasCredit) {
               throw StateError('write credit port closed');
@@ -302,18 +352,25 @@ class MultiIsolateKvStoreClient {
           'chunk': transferable,
         });
       }
+
+      if (aborted) {
+        throw KvAbortException(signal?.reason);
+      }
     } catch (e) {
-      workerPort.send(<String, dynamic>{
-        'type': 'writeAbort',
-        'writeId': writeId,
-      });
+      _sendAbortWrite(
+        routerPort: routerPort,
+        key: key,
+        extension: extension,
+        writeRequestId: writeRequestId,
+        writeId: writeId,
+      );
+      rethrow;
+    } finally {
+      signal?.removeAbortListener(onAbort);
+      await input.cancel();
       await creditIterator?.cancel();
       creditPort?.close();
-      rethrow;
     }
-
-    await creditIterator?.cancel();
-    creditPort?.close();
 
     final endReply = ReceivePort();
     workerPort.send(<String, dynamic>{
@@ -336,6 +393,7 @@ class MultiIsolateKvStoreClient {
     Stream<List<int>> data, {
     String extension = 'bin',
     bool truncateExisting = true,
+    KvAbortSignal? signal,
   }) async {
     _ensureOpen();
     final direct = KvDirectIo(
@@ -347,6 +405,7 @@ class MultiIsolateKvStoreClient {
       data,
       extension: extension,
       truncateExisting: truncateExisting,
+      signal: signal,
     );
   }
 
@@ -438,12 +497,23 @@ class MultiIsolateKvStoreClient {
     String key, {
     String extension = 'bin',
     bool checkExists = true,
+    KvAbortSignal? signal,
   }) {
+    if (signal != null && _routerPort != null) {
+      return _readBytesRouted(
+        _rootDirPath,
+        key,
+        extension: extension,
+        checkExists: checkExists,
+        signal: signal,
+      );
+    }
     return _readBytesAt(
       _rootDirPath,
       key,
       extension: extension,
       checkExists: checkExists,
+      signal: signal,
     );
   }
 
@@ -452,11 +522,17 @@ class MultiIsolateKvStoreClient {
     String key, {
     required String extension,
     required bool checkExists,
+    KvAbortSignal? signal,
   }) async {
     final file = _fileFor(rootDirPath, key, extension);
 
+    Future<Uint8List> readFuture() => file.readAsBytes();
+
     try {
-      return await file.readAsBytes();
+      if (signal != null) {
+        return await raceWithAbort(readFuture(), signal);
+      }
+      return await readFuture();
     } catch (e) {
       if (checkExists && kvIsNotFoundError(e)) {
         throw KvNotFoundException(key, extension);
@@ -465,11 +541,32 @@ class MultiIsolateKvStoreClient {
     }
   }
 
+  Future<Uint8List> _readBytesRouted(
+    String rootDirPath,
+    String key, {
+    required String extension,
+    required bool checkExists,
+    required KvAbortSignal signal,
+  }) async {
+    final bytes = <int>[];
+    await for (final chunk in _readStreamRouted(
+      rootDirPath,
+      key,
+      extension: extension,
+      checkExists: checkExists,
+      signal: signal,
+    )) {
+      bytes.addAll(chunk);
+    }
+    return Uint8List.fromList(bytes);
+  }
+
   /// Reads many keys concurrently in the caller isolate.
   Future<Map<String, Uint8List>> readBytesAll(
     Iterable<String> keys, {
     String extension = 'bin',
     bool checkExists = true,
+    KvAbortSignal? signal,
   }) async {
     final keyList = keys is List<String> ? keys : keys.toList(growable: false);
     final entries = await Future.wait(
@@ -480,6 +577,7 @@ class MultiIsolateKvStoreClient {
             key,
             extension: extension,
             checkExists: checkExists,
+            signal: signal,
           ),
         ),
       ),
@@ -492,12 +590,23 @@ class MultiIsolateKvStoreClient {
     String key, {
     String extension = 'bin',
     bool checkExists = true,
+    KvAbortSignal? signal,
   }) {
+    if (signal != null && _routerPort != null) {
+      return _readStreamRouted(
+        _rootDirPath,
+        key,
+        extension: extension,
+        checkExists: checkExists,
+        signal: signal,
+      );
+    }
     return _readStreamAt(
       _rootDirPath,
       key,
       extension: extension,
       checkExists: checkExists,
+      signal: signal,
     );
   }
 
@@ -507,12 +616,23 @@ class MultiIsolateKvStoreClient {
     String key, {
     String extension = 'bin',
     bool checkExists = true,
+    KvAbortSignal? signal,
   }) {
+    if (signal != null && _routerPort != null) {
+      return _readStreamRouted(
+        rootDirPath,
+        key,
+        extension: extension,
+        checkExists: checkExists,
+        signal: signal,
+      );
+    }
     return _readStreamAt(
       rootDirPath,
       key,
       extension: extension,
       checkExists: checkExists,
+      signal: signal,
     );
   }
 
@@ -521,19 +641,132 @@ class MultiIsolateKvStoreClient {
     String key, {
     required String extension,
     required bool checkExists,
+    KvAbortSignal? signal,
   }) async* {
     final file = _fileFor(rootDirPath, key, extension);
+    final input = StreamIterator<List<int>>(file.openRead());
+    var aborted = false;
+    void onAbort() {
+      aborted = true;
+      input.cancel();
+    }
+
+    signal?.onAbort(onAbort);
 
     try {
-      await for (final chunk in file.openRead()) {
-        yield chunk;
+      while (true) {
+        signal?.throwIfAborted();
+        if (aborted) {
+          throw KvAbortException(signal?.reason);
+        }
+        if (!await input.moveNext()) {
+          break;
+        }
+        yield input.current;
       }
     } catch (e) {
+      if (aborted && e is! KvAbortException) {
+        throw KvAbortException(signal?.reason);
+      }
       if (checkExists && kvIsNotFoundError(e)) {
         throw KvNotFoundException(key, extension);
       }
       rethrow;
+    } finally {
+      signal?.removeAbortListener(onAbort);
+      await input.cancel();
     }
+  }
+
+  Stream<List<int>> _readStreamRouted(
+    String rootDirPath,
+    String key, {
+    required String extension,
+    required bool checkExists,
+    required KvAbortSignal signal,
+  }) async* {
+    signal.throwIfAborted();
+    _ensureWriteCapable();
+    final routerPort = _routerPort!;
+    final readRequestId = _nextReadRequestId++;
+
+    final chunkPort = ReceivePort();
+    final replyPort = ReceivePort();
+    routerPort.send(<String, dynamic>{
+      'type': 'openRead',
+      'key': key,
+      'ext': extension,
+      'readRequestId': readRequestId,
+      'chunkPort': chunkPort.sendPort,
+      'replyPort': replyPort.sendPort,
+    });
+
+    late Map<dynamic, dynamic> ack;
+    try {
+      ack = await raceWithAbort(
+        replyPort.first.then((value) => value as Map<dynamic, dynamic>),
+        signal,
+      );
+    } on KvAbortException {
+      replyPort.close();
+      chunkPort.close();
+      rethrow;
+    }
+    replyPort.close();
+    kvThrowIfError(ack);
+
+    final readId = ack['readId'] as int;
+    var aborted = false;
+    void onAbort() {
+      if (aborted) return;
+      aborted = true;
+      routerPort.send(<String, dynamic>{
+        'type': 'cancelRead',
+        'readId': readId,
+        'key': key,
+      });
+      chunkPort.close();
+    }
+
+    signal.onAbort(onAbort);
+
+    try {
+      await for (final message in chunkPort) {
+        if (message is Map) {
+          if (message['aborted'] == true) {
+            throw KvAbortException(signal.reason);
+          }
+          kvThrowIfError(message);
+        } else if (message is TransferableTypedData) {
+          yield message.materialize().asUint8List();
+        } else if (message == null) {
+          break;
+        }
+      }
+    } finally {
+      signal.removeAbortListener(onAbort);
+      chunkPort.close();
+    }
+
+    if (aborted) {
+      throw KvAbortException(signal.reason);
+    }
+  }
+
+  void _sendAbortWrite({
+    required SendPort routerPort,
+    required String key,
+    required String extension,
+    required int writeRequestId,
+    int? writeId,
+  }) {
+    routerPort.send(<String, dynamic>{
+      'type': 'abortWrite',
+      'key': key,
+      'ext': extension,
+      'writeRequestId': writeRequestId,
+      if (writeId != null) 'writeId': writeId,
+    });
   }
 
   /// Deletes a key directly in the caller isolate.

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:hashed_kv_store/hashed_kv_store.dart';
 import 'package:path/path.dart' as p;
@@ -812,7 +813,8 @@ void main() {
     const ext = 'txt';
 
     final controllerA = StreamController<List<int>>();
-    final writeA = store.writeFromStream(key, controllerA.stream, extension: ext);
+    final writeA =
+        store.writeFromStream(key, controllerA.stream, extension: ext);
     controllerA.add(utf8.encode('partial'));
 
     final writeB = store.writeFromStream(
@@ -863,7 +865,8 @@ void main() {
     );
 
     final bytes = <int>[];
-    await for (final chunk in fsyncStore.readStream('fsync:key', extension: 'txt')) {
+    await for (final chunk
+        in fsyncStore.readStream('fsync:key', extension: 'txt')) {
       bytes.addAll(chunk);
     }
     expect(utf8.decode(bytes), equals('synced'));
@@ -976,7 +979,8 @@ void main() {
       expect(utf8.decode(bytes), equals(content));
     });
 
-    test('readBytes with checkExists true on missing key throws KvNotFoundException',
+    test(
+        'readBytes with checkExists true on missing key throws KvNotFoundException',
         () async {
       await expectLater(
         store.readBytes('missing:bytes'),
@@ -984,7 +988,8 @@ void main() {
       );
     });
 
-    test('readBytes with checkExists false on missing key throws on read', () async {
+    test('readBytes with checkExists false on missing key throws on read',
+        () async {
       await expectLater(
         store.readBytes('missing:bytes', checkExists: false),
         throwsA(isA<FileSystemException>()),
@@ -1000,8 +1005,7 @@ void main() {
       );
 
       final bytes = <int>[];
-      await for (final chunk
-          in store.readStream(key, checkExists: false)) {
+      await for (final chunk in store.readStream(key, checkExists: false)) {
         bytes.addAll(chunk);
       }
       expect(bytes, equals([9, 8, 7]));
@@ -1078,6 +1082,123 @@ void main() {
     });
   });
 
+  group('abort/cancellation', () {
+    test('abort before write starts throws and writes nothing', () async {
+      final controller = KvAbortController();
+      controller.abort();
+      await expectLater(
+        store.writeFromStream(
+          'abort:before',
+          Stream.value([1]),
+          signal: controller.signal,
+        ),
+        throwsA(isA<KvAbortException>()),
+      );
+      expect(await store.exists('abort:before'), isFalse);
+    });
+
+    test('abort during write preserves prior truncate content', () async {
+      const key = 'abort:during';
+      const ext = 'txt';
+      await store.writeFromStream(
+        key,
+        Stream.value(utf8.encode('original')),
+        extension: ext,
+      );
+
+      final controller = KvAbortController();
+      final hold = StreamController<List<int>>();
+      final writeFuture = store.writeFromStream(
+        key,
+        hold.stream,
+        extension: ext,
+        signal: controller.signal,
+      );
+      hold.add(utf8.encode('partial'));
+      await Future.delayed(const Duration(milliseconds: 50));
+      controller.abort();
+      await expectLater(writeFuture, throwsA(isA<KvAbortException>()));
+
+      final bytes = await store.readBytes(key, extension: ext);
+      expect(utf8.decode(bytes), equals('original'));
+    });
+
+    test('aborted write releases same-key queue', () async {
+      const key = 'abort:queue';
+      final hold = StreamController<List<int>>();
+      final controller = KvAbortController();
+
+      final w1 = store.writeFromStream(
+        key,
+        hold.stream,
+        signal: controller.signal,
+      );
+      hold.add([1]);
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      final w2 = store.writeFromStream(key, Stream.value([2]));
+
+      controller.abort();
+      await expectLater(w1, throwsA(isA<KvAbortException>()));
+      await w2;
+
+      expect(await store.readBytes(key), equals([2]));
+    });
+
+    test('abort during queued openWrite throws KvAbortException', () async {
+      const key = 'abort:queued';
+      final hold = StreamController<List<int>>();
+      unawaited(store.writeFromStream(key, hold.stream));
+      hold.add([1]);
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      final controller = KvAbortController();
+      final queued = store.writeFromStream(
+        key,
+        Stream.value([9]),
+        signal: controller.signal,
+      );
+      await Future.delayed(const Duration(milliseconds: 50));
+      controller.abort();
+      await expectLater(queued, throwsA(isA<KvAbortException>()));
+    });
+
+    test('abort read stops worker-side streaming', () async {
+      const key = 'abort:read';
+      final payload = Uint8List.fromList(List.filled(64 * 1024, 7));
+      await store.writeFromStream(key, Stream.value(payload));
+
+      final controller = KvAbortController();
+      final readFuture = () async {
+        final bytes = <int>[];
+        await for (final chunk
+            in store.readStream(key, signal: controller.signal)) {
+          bytes.addAll(chunk);
+          if (bytes.length > 1024) {
+            controller.abort();
+          }
+        }
+        return bytes;
+      }();
+
+      await expectLater(readFuture, throwsA(isA<KvAbortException>()));
+    });
+
+    test('abort is idempotent', () {
+      final controller = KvAbortController();
+      controller.abort('first');
+      controller.abort('second');
+      expect(controller.signal.aborted, isTrue);
+      expect(controller.signal.reason, equals('first'));
+    });
+
+    test('write without signal still succeeds', () async {
+      const key = 'abort:no-signal';
+      await store.writeFromStream(key, Stream.value([4, 5, 6]));
+      expect(await store.readBytes(key), equals([4, 5, 6]));
+    });
+  });
+
   test('queued write drains after open failure in worker queue', () async {
     const key = 'open:fail:drain';
     const ext = 'txt';
@@ -1145,7 +1266,8 @@ void main() {
   });
 
   group('layout version migration', () {
-    test('fresh root writes metadata and preserves data across respawn', () async {
+    test('fresh root writes metadata and preserves data across respawn',
+        () async {
       final dir = await Directory.systemTemp.createTemp('kv_layout_fresh_');
       try {
         final first = await MultiIsolateKvStoreClient.spawn(
@@ -1171,7 +1293,8 @@ void main() {
           numWriteWorkers: 1,
         );
         final bytes = <int>[];
-        await for (final chunk in second.readStream('persist', extension: 'txt')) {
+        await for (final chunk
+            in second.readStream('persist', extension: 'txt')) {
           bytes.addAll(chunk);
         }
         expect(utf8.decode(bytes), equals('ok'));

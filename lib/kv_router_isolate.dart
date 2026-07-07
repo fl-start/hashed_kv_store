@@ -189,6 +189,48 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
     workerPort.send(cmd);
   }
 
+  Future<void> handleAbortWrite(_Cmd cmd) async {
+    final key = cmd['key'] as String;
+    final workerIdx = workerIndexForKey(key);
+    try {
+      final workerPort = await getWorkerPort(workerIdx);
+      workerPort.send(cmd);
+    } catch (e, st) {
+      kvSendError(cmd['replyPort'] as SendPort?, e, st);
+    }
+  }
+
+  Future<void> handleOpenRead(_Cmd cmd) async {
+    final key = cmd['key'] as String;
+    final ext = cmd['ext'] as String;
+    final replyPort = cmd['replyPort'] as SendPort;
+    final workerIdx = workerIndexForKey(key);
+
+    try {
+      final workerPort = await getWorkerPort(workerIdx);
+      cmd['filePath'] = HashedKvPath.pathForKey(
+        rootDirPath,
+        key,
+        ext,
+        folderHierarchyLevels,
+      );
+      workerPort.send(cmd);
+    } catch (e, st) {
+      kvSendError(replyPort, e, st);
+    }
+  }
+
+  Future<void> handleCancelRead(_Cmd cmd) async {
+    final key = cmd['key'] as String;
+    final workerIdx = workerIndexForKey(key);
+    try {
+      final workerPort = await getWorkerPort(workerIdx);
+      workerPort.send(cmd);
+    } catch (e, st) {
+      kvSendError(cmd['replyPort'] as SendPort?, e, st);
+    }
+  }
+
   Future<void> handleDelete(_Cmd cmd) async {
     final key = cmd['key'] as String;
     final ext = cmd['ext'] as String;
@@ -255,6 +297,15 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
         break;
       case 'delete':
         unawaited(handleDelete(cmd));
+        break;
+      case 'abortWrite':
+        unawaited(handleAbortWrite(cmd));
+        break;
+      case 'openRead':
+        unawaited(handleOpenRead(cmd));
+        break;
+      case 'cancelRead':
+        unawaited(handleCancelRead(cmd));
         break;
       case 'shutdown':
         unawaited(handleShutdown(cmd['replyPort'] as SendPort));

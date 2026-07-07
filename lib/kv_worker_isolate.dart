@@ -33,14 +33,28 @@ class _QueuedWrite {
   final SendPort replyPort;
   final String? filePath;
   final SendPort? creditPort;
+  final int writeRequestId;
 
   _QueuedWrite({
     required this.key,
     required this.ext,
     required this.truncate,
     required this.replyPort,
+    required this.writeRequestId,
     this.filePath,
     this.creditPort,
+  });
+}
+
+class _ReadContext {
+  final int readId;
+  final SendPort chunkPort;
+  StreamSubscription<List<int>>? subscription;
+  var cancelled = false;
+
+  _ReadContext({
+    required this.readId,
+    required this.chunkPort,
   });
 }
 
@@ -86,8 +100,11 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
   final pendingDeletesForKey = <String, List<_QueuedDelete>>{};
   final writes = <int, _WriteContext>{};
   final creditPortsForWrite = <int, SendPort>{};
+  final writeRequestIdForWriteId = <int, int>{};
+  final activeReads = <int, _ReadContext>{};
 
   var nextWriteId = 1;
+  var nextReadId = 1;
   var anyActivityRecent = true;
   Timer? idleTimer;
 
@@ -323,6 +340,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         filePath: next.filePath,
       );
       writes[newWriteId] = ctx;
+      writeRequestIdForWriteId[newWriteId] = next.writeRequestId;
       registerWriteCredits(newWriteId, next.creditPort);
       sendOpenWriteAck(next.replyPort, newWriteId);
     } catch (e, st) {
@@ -340,7 +358,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
   void scheduleIdleCheckIfNeeded() {
     final isActive = activeWriteIdForKey.values.any((id) => id != null) ||
         pendingWritesForKey.values.any((queue) => queue.isNotEmpty) ||
-        pendingDeletesForKey.values.any((queue) => queue.isNotEmpty);
+        pendingDeletesForKey.values.any((queue) => queue.isNotEmpty) ||
+        activeReads.isNotEmpty;
 
     if (!isActive && !anyActivityRecent) {
       cancelIdleTimer();
@@ -348,7 +367,8 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         final stillActive =
             activeWriteIdForKey.values.any((id) => id != null) ||
                 pendingWritesForKey.values.any((queue) => queue.isNotEmpty) ||
-                pendingDeletesForKey.values.any((queue) => queue.isNotEmpty);
+                pendingDeletesForKey.values.any((queue) => queue.isNotEmpty) ||
+                activeReads.isNotEmpty;
         if (!stillActive) {
           routerControlPort?.send(<String, dynamic>{
             'type': 'workerExiting',
@@ -361,6 +381,82 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
       cancelIdleTimer();
       anyActivityRecent = false;
     }
+  }
+
+  Future<void> abortActiveWrite(int writeId, {SendPort? replyPort}) async {
+    creditPortsForWrite.remove(writeId);
+    writeRequestIdForWriteId.remove(writeId);
+    final ctx = writes.remove(writeId);
+    if (ctx == null) {
+      kvSendAbort(replyPort);
+      return;
+    }
+
+    await cleanupWriteContext(ctx);
+    endChannel(ctx.key, ctx.ext);
+    final k = chanId(ctx.key, ctx.ext);
+    activeWriteIdForKey[k] = null;
+    await processPendingDeletes(k);
+    await startQueuedWrite(k);
+    scheduleIdleCheckIfNeeded();
+    kvSendAbort(replyPort);
+  }
+
+  Future<void> handleAbortWrite(_Cmd cmd) async {
+    final key = cmd['key'] as String;
+    final ext = cmd['ext'] as String;
+    final writeRequestId = cmd['writeRequestId'] as int?;
+    final writeId = cmd['writeId'] as int?;
+    final replyPort = cmd['replyPort'] as SendPort?;
+    final k = chanId(key, ext);
+
+    if (writeId != null && writes.containsKey(writeId)) {
+      await abortActiveWrite(writeId, replyPort: replyPort);
+      return;
+    }
+
+    if (writeRequestId != null) {
+      final activeId = activeWriteIdForKey[k];
+      if (activeId != null &&
+          writeRequestIdForWriteId[activeId] == writeRequestId) {
+        await abortActiveWrite(activeId, replyPort: replyPort);
+        return;
+      }
+
+      final queue = pendingWritesForKey[k];
+      if (queue != null) {
+        final idx = queue
+            .indexWhere((queued) => queued.writeRequestId == writeRequestId);
+        if (idx >= 0) {
+          final removed = queue.removeAt(idx);
+          if (queue.isEmpty) {
+            pendingWritesForKey.remove(k);
+          }
+          kvSendAbort(removed.replyPort);
+          if (activeWriteIdForKey[k] == null &&
+              (pendingWritesForKey[k]?.isNotEmpty ?? false)) {
+            await startQueuedWrite(k);
+          }
+          kvSendAbort(replyPort);
+          return;
+        }
+      }
+    }
+
+    kvSendAbort(replyPort);
+  }
+
+  Future<void> cancelRead(int readId, {SendPort? replyPort}) async {
+    final ctx = activeReads.remove(readId);
+    if (ctx == null) {
+      kvSendAbort(replyPort);
+      return;
+    }
+
+    ctx.cancelled = true;
+    await ctx.subscription?.cancel();
+    ctx.chunkPort.send(<String, dynamic>{'aborted': true});
+    kvSendAbort(replyPort);
   }
 
   await for (final raw in cmdPort) {
@@ -380,6 +476,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           final truncate = cmd['truncate'] as bool? ?? true;
           final replyPort = cmd['replyPort'] as SendPort;
           final filePath = cmd['filePath'] as String?;
+          final writeRequestId = cmd['writeRequestId'] as int? ?? 0;
           final k = chanId(key, ext);
           final active = activeWriteIdForKey[k];
 
@@ -391,6 +488,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
                   ext: ext,
                   truncate: truncate,
                   replyPort: replyPort,
+                  writeRequestId: writeRequestId,
                   filePath: filePath,
                   creditPort: cmd['creditPort'] as SendPort?,
                 ));
@@ -410,6 +508,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
               filePath: filePath,
             );
             writes[writeId] = ctx;
+            writeRequestIdForWriteId[writeId] = writeRequestId;
             registerWriteCredits(writeId, cmd['creditPort'] as SendPort?);
             sendOpenWriteAck(replyPort, writeId);
           } catch (e, st) {
@@ -434,6 +533,7 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
         {
           final writeId = cmd['writeId'] as int;
           final ctx = writes[writeId];
+          // Late chunks after abort are ignored when writeId is unknown.
           if (ctx == null) break;
 
           try {
@@ -457,7 +557,9 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
           final writeId = cmd['writeId'] as int;
           final replyPort = cmd['replyPort'] as SendPort?;
           creditPortsForWrite.remove(writeId);
+          writeRequestIdForWriteId.remove(writeId);
           final ctx = writes.remove(writeId);
+          // Late writeEnd after abort is ignored when writeId is unknown.
           if (ctx == null) {
             kvSendError(replyPort, StateError('unknown writeId: $writeId'));
             break;
@@ -484,17 +586,69 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
       case 'writeAbort':
         {
           final writeId = cmd['writeId'] as int;
-          creditPortsForWrite.remove(writeId);
-          final ctx = writes.remove(writeId);
-          if (ctx == null) break;
+          await abortActiveWrite(writeId);
+        }
+        break;
 
-          await cleanupWriteContext(ctx);
-          final k = chanId(ctx.key, ctx.ext);
-          activeWriteIdForKey[k] = null;
-          await processPendingDeletes(k);
-          await startQueuedWrite(k);
+      case 'abortWrite':
+        await handleAbortWrite(cmd);
+        break;
+
+      case 'openRead':
+        {
+          final key = cmd['key'] as String;
+          final ext = cmd['ext'] as String;
+          final filePath = cmd['filePath'] as String;
+          final chunkPort = cmd['chunkPort'] as SendPort;
+          final replyPort = cmd['replyPort'] as SendPort;
+          final readId = nextReadId++;
+          final file = File(filePath);
+          final ctx = _ReadContext(readId: readId, chunkPort: chunkPort);
+          activeReads[readId] = ctx;
+
+          try {
+            if (!await file.exists()) {
+              activeReads.remove(readId);
+              kvSendError(replyPort, KvNotFoundException(key, ext));
+              break;
+            }
+
+            kvSendOk(replyPort, <String, dynamic>{'readId': readId});
+            final stream = file.openRead();
+            ctx.subscription = stream.listen(
+              (chunk) {
+                if (ctx.cancelled) return;
+                final bytes =
+                    chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+                chunkPort.send(TransferableTypedData.fromList([bytes]));
+              },
+              onError: (Object error, StackTrace stackTrace) {
+                activeReads.remove(readId);
+                chunkPort.send(<String, dynamic>{
+                  'error': error.toString(),
+                  'type': error.runtimeType.toString(),
+                  'stackTrace': stackTrace.toString(),
+                });
+              },
+              onDone: () {
+                activeReads.remove(readId);
+                if (!ctx.cancelled) {
+                  chunkPort.send(null);
+                }
+              },
+              cancelOnError: true,
+            );
+          } catch (e, st) {
+            activeReads.remove(readId);
+            kvSendError(replyPort, e, st);
+          }
           scheduleIdleCheckIfNeeded();
         }
+        break;
+
+      case 'cancelRead':
+        await cancelRead(cmd['readId'] as int,
+            replyPort: cmd['replyPort'] as SendPort?);
         break;
 
       case 'delete':

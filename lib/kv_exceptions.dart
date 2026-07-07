@@ -31,6 +31,21 @@ class KvLayoutMismatchException implements Exception {
       '(stored: $storedVersion, expected: $expectedVersion)';
 }
 
+/// Thrown when an operation is cancelled via [KvAbortSignal].
+class KvAbortException implements Exception {
+  final Object? reason;
+
+  KvAbortException([this.reason]);
+
+  @override
+  String toString() {
+    if (reason != null) {
+      return 'KvAbortException: $reason';
+    }
+    return 'KvAbortException';
+  }
+}
+
 /// Thrown when a write operation fails in a worker or folder isolate.
 class KvWriteException implements Exception {
   final String message;
@@ -88,7 +103,22 @@ bool kvIsNotFoundError(Object error) {
   return error is FileSystemException && kvIsPathNotFound(error);
 }
 
+void kvSendAbort(SendPort? port, [Object? reason]) {
+  port?.send(<String, dynamic>{
+    'aborted': true,
+    if (reason != null) 'reason': reason.toString(),
+  });
+}
+
+void kvThrowIfAbort(Map<dynamic, dynamic> response) {
+  if (response['aborted'] == true) {
+    final reason = response['reason'];
+    throw KvAbortException(reason);
+  }
+}
+
 void kvThrowIfError(Map<dynamic, dynamic> response) {
+  kvThrowIfAbort(response);
   final error = response['error'];
   if (error != null) {
     throw KvWriteException(

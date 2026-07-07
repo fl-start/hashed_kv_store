@@ -59,7 +59,8 @@ void main() {
       const root = '/data';
       const key = 'digest:test';
       final paths = HashedKvPath.pathsForKey(root, key, 'bin', 1);
-      expect(paths.filePath, equals(HashedKvPath.pathForKey(root, key, 'bin', 1)));
+      expect(
+          paths.filePath, equals(HashedKvPath.pathForKey(root, key, 'bin', 1)));
       expect(
         paths.folderPath,
         equals(HashedKvPath.folderPathForKey(root, key, 1)),

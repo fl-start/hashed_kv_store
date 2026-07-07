@@ -4,7 +4,8 @@ import 'dart:io';
 import 'package:hashed_kv_store/hashed_kv_store.dart';
 
 Future<void> main() async {
-  final storageDir = await Directory.systemTemp.createTemp('hashed_kv_example_');
+  final storageDir =
+      await Directory.systemTemp.createTemp('hashed_kv_example_');
   stdout.writeln('Storage directory: ${storageDir.path}');
 
   final store = await MultiIsolateKvStoreClient.spawn(

@@ -25,7 +25,7 @@ Add this package to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  hashed_kv_store: ^0.3.3
+  hashed_kv_store: ^0.4.0
 ```
 
 ## Usage
@@ -166,6 +166,44 @@ final response = await dio.get<ResponseBody>(
 await store.writeFromStream(key, response.data!.stream, extension: ext);
 ```
 
+### Cancellation
+
+```dart
+final controller = KvAbortController();
+final write = store.writeFromStream(
+  key,
+  dataStream,
+  signal: controller.signal,
+);
+
+controller.abort();
+
+try {
+  await write;
+} on KvAbortException {
+  // cancelled
+}
+```
+
+Bridge to Dio `CancelToken`:
+
+```dart
+final kvAbort = KvAbortController();
+final cancelToken = CancelToken();
+cancelToken.whenCancel.then((_) => kvAbort.abort('dio cancelled'));
+
+final response = await dio.get<ResponseBody>(
+  url,
+  cancelToken: cancelToken,
+  options: Options(responseType: ResponseType.stream),
+);
+await store.writeFromStream(
+  key,
+  response.data!.stream,
+  signal: kvAbort.signal,
+);
+```
+
 ## API Reference
 
 ### MultiIsolateKvStoreClient
@@ -249,9 +287,17 @@ Shuts down router, worker, and folder isolates. Idempotent.
 - After close, `writeFromStream`, `delete`, and `subscribeLive` throw `StateError`
 - Direct reads via `readStream` remain available
 
-#### `writeFromStreamDirect(String key, Stream<List<int>> data, {String extension = 'bin', bool truncateExisting = true})`
+#### `writeFromStream(..., {KvAbortSignal? signal})`
 
-Caller-isolate write with the same atomic truncate semantics as worker writes. Does not notify live subscribers. Works on read-only clients.
+Streaming write into the KV store via worker isolates. When [signal] is aborted, upstream consumption stops, `abortWrite` is sent to the router, and the future completes with [KvAbortException] without sending `writeEnd`.
+
+#### `writeFromStreamDirect(..., {KvAbortSignal? signal})`
+
+Caller-isolate write with the same atomic truncate semantics as worker writes. Aborted truncate writes delete in-progress temp files.
+
+#### `readBytes(..., {KvAbortSignal? signal})` / `readStream(..., {KvAbortSignal? signal})`
+
+When `signal` is non-null on a spawned client, reads are routed through a worker (`openRead` / `cancelRead`) so cancellation stops worker-side streaming. Without `signal`, reads remain direct in the caller isolate.
 
 #### `delete(String key, {String extension = 'bin'})`
 

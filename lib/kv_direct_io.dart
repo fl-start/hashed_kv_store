@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import 'hashed_kv_path.dart';
+import 'kv_abort.dart';
 import 'kv_exceptions.dart';
 
 /// Caller-isolate disk I/O aligned with production path layout and write semantics.
@@ -32,7 +33,10 @@ class KvDirectIo {
     Stream<List<int>> data, {
     String extension = 'bin',
     bool truncateExisting = true,
+    KvAbortSignal? signal,
   }) async {
+    signal?.throwIfAborted();
+
     final targetFile = File(pathForKey(key, extension: extension));
     await Directory(p.dirname(targetFile.path)).create(recursive: true);
 
@@ -40,19 +44,69 @@ class KvDirectIo {
       final writeId = _nextWriteId++;
       final tempFile = File('${targetFile.path}.$writeId.tmp');
       final sink = tempFile.openWrite();
-      await for (final chunk in data) {
-        sink.add(chunk);
+      try {
+        await _pumpStreamIntoSink(data, sink, signal: signal);
+        await sink.flush();
+        await sink.close();
+        await _publishTempFile(tempFile, targetFile);
+      } catch (e) {
+        try {
+          await sink.flush();
+        } catch (_) {}
+        try {
+          await sink.close();
+        } catch (_) {}
+        if (await tempFile.exists()) {
+          try {
+            await tempFile.delete();
+          } catch (_) {}
+        }
+        rethrow;
       }
-      await sink.flush();
-      await sink.close();
-      await _publishTempFile(tempFile, targetFile);
     } else {
       final sink = targetFile.openWrite(mode: FileMode.append);
-      await for (final chunk in data) {
-        sink.add(chunk);
+      try {
+        await _pumpStreamIntoSink(data, sink, signal: signal);
+        await sink.flush();
+        await sink.close();
+      } catch (e) {
+        try {
+          await sink.flush();
+        } catch (_) {}
+        try {
+          await sink.close();
+        } catch (_) {}
+        rethrow;
       }
-      await sink.flush();
-      await sink.close();
+    }
+  }
+
+  Future<void> _pumpStreamIntoSink(
+    Stream<List<int>> data,
+    IOSink sink, {
+    KvAbortSignal? signal,
+  }) async {
+    final input = StreamIterator<List<int>>(data);
+    // Cancelling the iterator unblocks a pending moveNext (completes it with
+    // false) so an abort mid-stream does not deadlock waiting for the producer.
+    void onAbort() {
+      unawaited(input.cancel());
+    }
+
+    signal?.onAbort(onAbort);
+    try {
+      while (true) {
+        signal?.throwIfAborted();
+        final hasNext = await input.moveNext();
+        signal?.throwIfAborted();
+        if (!hasNext) {
+          return;
+        }
+        sink.add(input.current);
+      }
+    } finally {
+      signal?.removeAbortListener(onAbort);
+      await input.cancel();
     }
   }
 
