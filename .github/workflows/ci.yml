@@ -8,7 +8,7 @@ on:
 
 jobs:
   # Pure-Dart package: analyze + unit/integration tests on every desktop
-  # architecture we support (Linux, Windows, macOS; x64 and ARM64).
+  # architecture we support (Linux, Windows, macOS ARM64).
   analyze-and-test:
     name: dart test (${{ matrix.os }})
     strategy:
@@ -19,7 +19,6 @@ jobs:
           - ubuntu-24.04-arm    # Linux ARM64
           - windows-latest      # Windows x64
           - windows-11-arm      # Windows ARM64
-          - macos-13            # macOS x64 (Intel)
           - macos-latest        # macOS ARM64 (Apple Silicon)
     runs-on: ${{ matrix.os }}
     steps:

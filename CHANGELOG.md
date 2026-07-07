@@ -2,7 +2,7 @@
 
 ### Added
 
-- CI now runs `dart test` across Linux, Windows, and macOS on both x64 and ARM64, plus on-device integration tests on an Android emulator and an iOS simulator (`example/integration_test`)
+- CI now runs `dart test` across Linux and Windows on x64 and ARM64, macOS on Apple Silicon (ARM64), plus on-device integration tests on an Android emulator and an iOS simulator (`example/integration_test`)
 
 ### Fixed
 
