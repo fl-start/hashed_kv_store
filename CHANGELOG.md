@@ -1,5 +1,9 @@
 ## 0.4.1
 
+### Added
+
+- CI now runs `dart test` across Linux, Windows, and macOS on both x64 and ARM64, plus on-device integration tests on an Android emulator and an iOS simulator (`example/integration_test`)
+
 ### Fixed
 
 - `writeFromStream` aborted before it subscribed (e.g. while awaiting the open ack) now drains the input stream, so a caller-owned `StreamController` can `close()` without hanging
