@@ -1261,9 +1261,9 @@ void main() {
       bytes.addAll(chunk);
     }
     expect(utf8.decode(bytes), equals('three'));
-  }, onPlatform: {
-    'windows': Skip('Timing-sensitive queue drain test'),
-  });
+  },
+      skip: 'Timing-sensitive: injects a worker open failure via a filesystem '
+          'race that is not deterministic across platforms/CI.');
 
   group('layout version migration', () {
     test('fresh root writes metadata and preserves data across respawn',
