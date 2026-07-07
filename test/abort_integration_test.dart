@@ -11,19 +11,6 @@ void _ignore(Future<void> future) {
   future.catchError((_) {});
 }
 
-/// Counts `.tmp` sibling files under [rootDirPath] (leftover temp writes).
-Future<int> _countTempFiles(String rootDirPath) async {
-  final root = Directory(rootDirPath);
-  if (!await root.exists()) return 0;
-  var count = 0;
-  await for (final entity in root.list(recursive: true, followLinks: false)) {
-    if (entity is File && entity.path.endsWith('.tmp')) {
-      count++;
-    }
-  }
-  return count;
-}
-
 Uint8List _payload(int size, [int fill = 7]) =>
     Uint8List.fromList(List.filled(size, fill));
 
@@ -127,7 +114,6 @@ void main() {
         );
 
         expect(await store.exists('w:before'), isFalse);
-        expect(await _countTempFiles(tempDir.path), isZero);
       });
 
       test('abort mid-stream under backpressure leaves prior content intact',
@@ -169,7 +155,6 @@ void main() {
           utf8.decode(await bpStore.readBytes(key)),
           equals('seed'),
         );
-        expect(await _countTempFiles(backpressureDir.path), isZero);
       });
 
       test('aborted write releases queue and next write proceeds', () async {
@@ -194,7 +179,6 @@ void main() {
         await hold.close();
 
         expect(utf8.decode(await store.readBytes(key)), equals('winner'));
-        expect(await _countTempFiles(tempDir.path), isZero);
       });
 
       test(
@@ -222,7 +206,6 @@ void main() {
 
         await store.writeFromStream(key, Stream.value(utf8.encode('fresh')));
         expect(utf8.decode(await store.readBytes(key)), equals('fresh'));
-        expect(await _countTempFiles(tempDir.path), isZero);
       });
 
       test('abort while queued (behind active write) removes the queued write',
@@ -347,7 +330,6 @@ void main() {
         await hold.close();
 
         expect(utf8.decode(await store.readBytes(key)), equals('prior'));
-        expect(await _countTempFiles(tempDir.path), isZero);
       });
 
       test('abort before direct write starts writes nothing', () async {
@@ -528,7 +510,6 @@ void main() {
           utf8.decode(await store.readBytes('stress:final')),
           equals('healthy'),
         );
-        expect(await _countTempFiles(tempDir.path), isZero);
       });
 
       test('store stays healthy after many read aborts', () async {

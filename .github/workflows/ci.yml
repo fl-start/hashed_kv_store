@@ -85,10 +85,19 @@ jobs:
         with:
           channel: stable
 
-      - name: Boot iOS simulator
-        uses: futureware-tech/simulator-action@v4
-        with:
-          model: 'iPhone 15'
+      - name: Boot an available iOS simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')
+          if [ -z "$UDID" ]; then
+            echo "No iPhone simulator available on this runner:"
+            xcrun simctl list devices
+            exit 1
+          fi
+          echo "Booting simulator $UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
 
       - name: Install example dependencies
         working-directory: example
@@ -96,7 +105,7 @@ jobs:
 
       - name: Run integration tests on simulator
         working-directory: example
-        run: flutter test integration_test
+        run: flutter test integration_test -d ${{ steps.sim.outputs.udid }}
 
   openspec:
     runs-on: ubuntu-latest
