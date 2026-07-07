@@ -255,7 +255,12 @@ class MultiIsolateKvStoreClient {
     bool truncateExisting = true,
     KvAbortSignal? signal,
   }) async {
-    signal?.throwIfAborted();
+    if (signal?.aborted ?? false) {
+      // Abort happened before we subscribed; still drain the caller's stream so
+      // a single-subscription source (e.g. StreamController) can close cleanly.
+      await _drainAndCancel(data);
+      throw KvAbortException(signal!.reason);
+    }
     _ensureWriteCapable();
     final routerPort = _routerPort!;
 
@@ -295,6 +300,9 @@ class MultiIsolateKvStoreClient {
         extension: extension,
         writeRequestId: writeRequestId,
       );
+      // We aborted while awaiting the open ack and never subscribed to the
+      // input; drain it so a caller-owned StreamController can close cleanly.
+      await _drainAndCancel(data);
       rethrow;
     }
     replyPort.close();
@@ -751,6 +759,16 @@ class MultiIsolateKvStoreClient {
     if (aborted) {
       throw KvAbortException(signal.reason);
     }
+  }
+
+  /// Subscribes to and immediately cancels [data] so a caller-provided
+  /// single-subscription stream can complete its own `close()` even when the
+  /// write is aborted before the main pump loop subscribes.
+  Future<void> _drainAndCancel(Stream<List<int>> data) async {
+    try {
+      final sub = data.listen(null, cancelOnError: true);
+      await sub.cancel();
+    } catch (_) {}
   }
 
   void _sendAbortWrite({

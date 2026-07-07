@@ -286,6 +286,30 @@ void main() {
         expect(await store.exists('w:concurrent:aborted'), isFalse);
       });
 
+      test('early abort still drains caller stream so close() completes',
+          () async {
+        // Regression: aborting before writeFromStream subscribes to the input
+        // must still consume the caller-owned StreamController, otherwise its
+        // close() blocks forever waiting for a listener.
+        final controller = KvAbortController();
+        controller.abort();
+
+        final hold = StreamController<List<int>>();
+        final writeFuture = store.writeFromStream(
+          'w:early-drain',
+          hold.stream,
+          signal: controller.signal,
+        );
+        hold.add(_payload(4096));
+
+        await expectLater(writeFuture, throwsA(isA<KvAbortException>()));
+        await expectLater(
+          hold.close().timeout(const Duration(seconds: 5)),
+          completes,
+        );
+        expect(await store.exists('w:early-drain'), isFalse);
+      });
+
       test('write completes normally when signal is never aborted', () async {
         const key = 'w:not-aborted';
         final controller = KvAbortController();

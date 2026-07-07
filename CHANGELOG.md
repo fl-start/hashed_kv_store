@@ -2,7 +2,9 @@
 
 ### Fixed
 
+- `writeFromStream` aborted before it subscribed (e.g. while awaiting the open ack) now drains the input stream, so a caller-owned `StreamController` can `close()` without hanging
 - CI dependency install no longer fails resolving the Flutter `example/` package on the Dart-only runner; `dart pub get --no-example` scopes resolution to the root package
+- CI `dart analyze` scoped to `lib`/`test` so it no longer fails on the unresolved `benchmark/` and `example/` sub-packages
 
 ## 0.4.0
 
