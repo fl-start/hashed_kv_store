@@ -12,6 +12,7 @@ import 'kv_exceptions.dart';
 import 'kv_layout_migration.dart';
 import 'kv_path_cache.dart';
 import 'kv_router_isolate.dart';
+import 'kv_trace.dart';
 
 export 'kv_exceptions.dart';
 
@@ -263,8 +264,14 @@ class MultiIsolateKvStoreClient {
     }
     _ensureWriteCapable();
     final routerPort = _routerPort!;
+    final trace = KvTraceWrite.begin(key);
 
     final writeRequestId = _nextWriteRequestId++;
+    trace?.event('write_start', {
+      'ext': extension,
+      'reqId': writeRequestId,
+      'truncate': truncateExisting,
+    });
 
     ReceivePort? creditPort;
     if (_writeMaxInFlightChunks > 0) {
@@ -310,6 +317,16 @@ class MultiIsolateKvStoreClient {
 
     final writeId = ack['writeId'] as int;
     final workerPort = ack['workerPort'] as SendPort;
+    trace?.eventWithMs('write_open_ack', {
+      'ext': extension,
+      'reqId': writeRequestId,
+      'writeId': writeId,
+    });
+    trace?.slow('write_open_ack', {
+      'ext': extension,
+      'reqId': writeRequestId,
+      'writeId': writeId,
+    });
 
     StreamIterator<dynamic>? creditIterator;
     var credits = _writeMaxInFlightChunks;
@@ -389,6 +406,16 @@ class MultiIsolateKvStoreClient {
     final endAck = await endReply.first as Map;
     endReply.close();
     kvThrowIfError(endAck);
+    trace?.eventWithMs('write_end_ack', {
+      'ext': extension,
+      'reqId': writeRequestId,
+      'writeId': writeId,
+    });
+    trace?.slow('write_end_ack', {
+      'ext': extension,
+      'reqId': writeRequestId,
+      'writeId': writeId,
+    });
   }
 
   /// Caller-isolate write bypassing worker isolates.

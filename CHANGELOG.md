@@ -1,3 +1,10 @@
+## 0.4.2
+
+### Added
+
+- Opt-in write-path tracing via `--dart-define=KV_STORE_TRACE=true` (`KvTraceWrite`, `developer.log` under `hashed_kv_store`)
+- Slow-path logs (≥5s) for router folder ensure, worker open/write-end, and client open/end acks
+
 ## 0.4.1
 
 ### Added

@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'hashed_kv_path.dart';
 import 'kv_exceptions.dart';
+import 'kv_trace.dart';
 
 typedef _Cmd = Map<String, dynamic>;
 
@@ -331,6 +332,13 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     final newWriteId = nextWriteId++;
     activeWriteIdForKey[k] = newWriteId;
 
+    final trace = KvTraceWrite.begin(next.key);
+    trace?.event('worker_start_write', {
+      'ext': next.ext,
+      'writeId': newWriteId,
+      'worker': workerIndex,
+      'queued': queue.length,
+    });
     try {
       final ctx = await openWriteContext(
         key: next.key,
@@ -343,6 +351,11 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
       writeRequestIdForWriteId[newWriteId] = next.writeRequestId;
       registerWriteCredits(newWriteId, next.creditPort);
       sendOpenWriteAck(next.replyPort, newWriteId);
+      trace?.slow('worker_open_write_ctx', {
+        'ext': next.ext,
+        'writeId': newWriteId,
+        'worker': workerIndex,
+      });
     } catch (e, st) {
       activeWriteIdForKey[k] = null;
       kvSendError(next.replyPort, e, st);
@@ -565,6 +578,12 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
             break;
           }
 
+          final trace = KvTraceWrite.begin(ctx.key);
+          trace?.event('worker_write_end_start', {
+            'ext': ctx.ext,
+            'writeId': writeId,
+            'worker': workerIndex,
+          });
           try {
             await completeWriteContext(ctx);
             endChannel(ctx.key, ctx.ext);
@@ -574,6 +593,16 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
             activeWriteIdForKey[k] = null;
             await processPendingDeletes(k);
             await startQueuedWrite(k);
+            trace?.eventWithMs('worker_write_end_done', {
+              'ext': ctx.ext,
+              'writeId': writeId,
+              'worker': workerIndex,
+            });
+            trace?.slow('worker_write_end', {
+              'ext': ctx.ext,
+              'writeId': writeId,
+              'worker': workerIndex,
+            });
           } catch (e, st) {
             await cleanupWriteContext(ctx);
             await failChannel(ctx.key, ctx.ext, e);

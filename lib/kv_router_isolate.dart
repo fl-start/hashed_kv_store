@@ -4,6 +4,7 @@ import 'dart:isolate';
 
 import 'hashed_kv_path.dart';
 import 'kv_exceptions.dart';
+import 'kv_trace.dart';
 import 'kv_worker_isolate.dart';
 
 typedef _Cmd = Map<String, dynamic>;
@@ -158,6 +159,8 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
     final ext = cmd['ext'] as String;
     final replyPort = cmd['replyPort'] as SendPort;
     final workerIdx = workerIndexForKey(key);
+    final trace = KvTraceWrite.begin(key);
+    trace?.event('router_open_write', {'ext': ext, 'worker': workerIdx});
 
     try {
       final workerPort = await getWorkerPort(workerIdx);
@@ -168,10 +171,20 @@ void kvRouterIsolateEntry(List<dynamic> args) async {
         folderHierarchyLevels,
       );
       await ensureFolder(paths.folderPath);
+      trace?.slow('router_ensure_folder', {'ext': ext, 'worker': workerIdx});
 
       cmd['filePath'] = paths.filePath;
       workerPort.send(cmd);
+      trace?.eventWithMs('router_open_write_forwarded', {
+        'ext': ext,
+        'worker': workerIdx,
+      });
     } catch (e, st) {
+      trace?.eventWithMs('router_open_write_failed', {
+        'ext': ext,
+        'worker': workerIdx,
+        'error': e.toString(),
+      });
       kvSendError(replyPort, e, st);
     }
   }
