@@ -230,7 +230,16 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
     if (truncate) {
       await cleanupStaleTempFiles(targetFile);
       final tempFile = File('${targetFile.path}.$writeId.tmp');
+      // Create eagerly: `openWrite()` starts the open in the IOSink's consumer
+      // constructor and nothing listens to that future until the first chunk
+      // arrives, so an open failure would surface as an uncaught async error
+      // and kill this isolate. Awaiting `create()` keeps the failure inside
+      // the caller's try/catch, which replies with an error instead.
+      await tempFile.create();
       final sink = tempFile.openWrite();
+      // Write errors after a successful open land on `done`; keep a listener
+      // so they are reported by flush()/close() instead of killing the isolate.
+      unawaited(sink.done.catchError((Object _) {}));
       return _WriteContext(
         sink: sink,
         key: key,
@@ -241,7 +250,9 @@ void kvWriteWorkerIsolateEntry(List<dynamic> args) async {
       );
     }
 
+    await targetFile.create();
     final sink = targetFile.openWrite(mode: FileMode.append);
+    unawaited(sink.done.catchError((Object _) {}));
     return _WriteContext(
       sink: sink,
       key: key,

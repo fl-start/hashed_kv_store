@@ -1,3 +1,18 @@
+## Unreleased
+
+### Fixed
+
+- A write whose file could not be created killed the write worker isolate:
+  `File.openWrite()` starts the open in its consumer's constructor and nothing
+  listens to that future until the first chunk arrives, so the failure surfaced
+  as an uncaught async error. `errorsAreFatal` then took the worker down, and
+  because sends to a dead `SendPort` are discarded, the failing write, every
+  later write/delete routed to that worker, and `close()` all hung forever.
+  The worker now creates the file eagerly so the error is reported to the
+  caller as a `KvWriteException`, and keeps a listener on the sink's `done` so
+  a failure after a successful open (e.g. a full or removed volume) is reported
+  by `flush()`/`close()` instead of killing the isolate.
+
 ## 0.4.2
 
 ### Added

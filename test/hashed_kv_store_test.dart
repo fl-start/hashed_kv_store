@@ -1199,71 +1199,106 @@ void main() {
     });
   });
 
+  test('open failure is reported and the write worker survives', () async {
+    // `extension` is appended verbatim to the hashed file name, so a value
+    // that is not a legal path component puts the temp file in a directory
+    // that does not exist. The open then fails on every platform.
+    final dir = await Directory.systemTemp.createTemp('kv_open_fail_');
+    final failStore = await MultiIsolateKvStoreClient.spawn(
+      rootDirPath: dir.path,
+      numWriteWorkers: 1,
+    );
+    try {
+      await expectLater(
+        failStore.writeFromStream(
+          'open:fail:survive',
+          Stream.value(utf8.encode('nope')),
+          extension: 'a/b',
+        ),
+        throwsA(isA<KvWriteException>()),
+      );
+
+      // One worker, so everything below is served by the isolate that just saw
+      // the failure. It used to die with an uncaught async error, after which
+      // every request was silently dropped and its future never completed.
+      await failStore
+          .writeFromStream('open:fail:after', Stream.value(utf8.encode('ok')))
+          .timeout(const Duration(seconds: 10));
+      expect(
+        utf8.decode(await failStore.readBytes('open:fail:after')),
+        equals('ok'),
+      );
+      await failStore
+          .delete('open:fail:after')
+          .timeout(const Duration(seconds: 10));
+      await failStore.close().timeout(const Duration(seconds: 10));
+    } finally {
+      if (!failStore.isClosed) {
+        await failStore.close().timeout(const Duration(seconds: 10));
+      }
+      if (await dir.exists()) {
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
+      }
+    }
+  });
+
   test('queued write drains after open failure in worker queue', () async {
     const key = 'open:fail:drain';
     const ext = 'txt';
 
-    await store.writeFromStream(
-      key,
-      Stream.value(utf8.encode('seed')),
-      extension: ext,
+    final dir = await Directory.systemTemp.createTemp('kv_open_fail_queue_');
+    final queueStore = await MultiIsolateKvStoreClient.spawn(
+      rootDirPath: dir.path,
+      numWriteWorkers: 1,
     );
+    try {
+      final path = queueStore.pathForKey(key, extension: ext);
 
-    final path = store.pathForKey(key, extension: ext);
-    final hold = StreamController<List<int>>();
-    var w1Done = false;
-    final w1 = store
-        .writeFromStream(key, hold.stream, extension: ext)
-        .whenComplete(() => w1Done = true);
-    hold.add(utf8.encode('one'));
+      // w1 holds the channel open, so w2 and w3 queue behind it in the worker.
+      final hold = StreamController<List<int>>();
+      final w1 = queueStore.writeFromStream(key, hold.stream, extension: ext);
+      hold.add(utf8.encode('one'));
+      final w2 = queueStore.writeFromStream(
+        key,
+        Stream.value(utf8.encode('two')),
+        extension: ext,
+      );
+      final w3 = queueStore.writeFromStream(
+        key,
+        Stream.value(utf8.encode('three')),
+        extension: ext,
+      );
 
-    final w2 = store.writeFromStream(
-      key,
-      Stream.value(utf8.encode('two')),
-      extension: ext,
-      truncateExisting: false,
-    );
-    final w3 = store.writeFromStream(
-      key,
-      Stream.value(utf8.encode('three')),
-      extension: ext,
-    );
+      // The worker writes to `<target>.<writeId>.tmp` and hands out write ids
+      // in queue order, so a directory at the next id's path makes the queued
+      // w2 fail to open with no timing window to lose. w1 is still holding the
+      // channel, so this lands well before w2 starts.
+      final activeTempId = await _activeTempWriteId(path);
+      await Directory('$path.${activeTempId + 1}.tmp').create();
 
-    unawaited(() async {
-      while (!w1Done) {
-        await Future.delayed(const Duration(microseconds: 100));
+      await hold.close();
+      await w1.timeout(const Duration(seconds: 10));
+      await expectLater(w2, throwsA(isA<KvWriteException>()));
+
+      // The failed open must release the channel so the rest of the queue runs.
+      await w3.timeout(const Duration(seconds: 10));
+      expect(
+        utf8.decode(await queueStore.readBytes(key, extension: ext)),
+        equals('three'),
+      );
+    } finally {
+      if (!queueStore.isClosed) {
+        await queueStore.close().timeout(const Duration(seconds: 10));
       }
-      for (var i = 0; i < 300; i++) {
-        if (await File(path).exists()) {
-          try {
-            await File(path).delete();
-            await Directory(path).create();
-            return;
-          } catch (_) {}
-        }
-        await Future.delayed(const Duration(microseconds: 100));
+      if (await dir.exists()) {
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
       }
-    }());
-
-    hold.close();
-    await w1;
-
-    await expectLater(w2, throwsA(isA<KvWriteException>()));
-
-    if (await Directory(path).exists()) {
-      await Directory(path).delete(recursive: true);
     }
-
-    await w3;
-
-    final bytes = <int>[];
-    await for (final chunk in store.readStream(key, extension: ext)) {
-      bytes.addAll(chunk);
-    }
-    expect(utf8.decode(bytes), equals('three'));
-  },
-      skip: 'Timing-sensitive: injects a worker open failure via a filesystem '
-          'race that is not deterministic across platforms/CI.');
+  });
 
   group('layout version migration', () {
     test('fresh root writes metadata and preserves data across respawn',
@@ -1382,4 +1417,26 @@ void main() {
       }
     });
   });
+}
+
+/// Write id of the temp file an in-flight truncate write is holding open at
+/// [targetPath]. The write must still be open, so exactly one temp file exists.
+Future<int> _activeTempWriteId(String targetPath) async {
+  final parent = Directory(p.dirname(targetPath));
+  final prefix = '$targetPath.';
+  final deadline = DateTime.now().add(const Duration(seconds: 10));
+  while (DateTime.now().isBefore(deadline)) {
+    if (await parent.exists()) {
+      await for (final entity in parent.list()) {
+        if (entity is! File) continue;
+        final name = entity.path;
+        if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue;
+        final id = name.substring(prefix.length, name.length - '.tmp'.length);
+        final parsed = int.tryParse(id);
+        if (parsed != null) return parsed;
+      }
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  throw StateError('no in-flight temp file for $targetPath');
 }
